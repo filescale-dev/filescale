@@ -1,0 +1,25 @@
+# Built binary
+/filescale
+/filescale.exe
+
+# Binaries and test artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go workspaces
+go.work
+go.work.sum
+
+# Environment files
+.env
+.env.*
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+*.swp
