@@ -1453,6 +1453,99 @@ func TestEmptyFile(t *testing.T) {
 	}
 }
 
+func TestCorruptMetadata(t *testing.T) {
+	e := newEnv(t, 12)
+	ctx := context.Background()
+	okData := random(10 << 10)
+	e.mustPut("ok", okData)
+
+	// Doubled and truncated stores return 500 without leaking file headers or panicking.
+	for _, tc := range []struct {
+		name   string
+		stores int
+	}{
+		{"doubled", 10},
+		{"short", 3},
+	} {
+		e.mustPut(tc.name, random(10<<10))
+		f := e.file(tc.name)
+		bad := *f
+		bad.Stores = make([]db.UUID, tc.stores)
+		copy(bad.Stores, f.Stores)
+		e.db.PutFile(ctx, &bad)
+		for _, m := range []string{"GET", "HEAD"} {
+			resp, _ := e.do(m, tc.name, nil)
+			if resp.StatusCode != http.StatusInternalServerError {
+				t.Errorf("%s %s: %s, want 500", m, tc.name, resp.Status)
+			}
+			if resp.Header.Get("ETag") != "" || resp.Header.Get("Content-Disposition") != "" {
+				t.Errorf("%s %s: leaked file headers %v", m, tc.name, resp.Header)
+			}
+		}
+	}
+	if resp, got := e.do("GET", "ok", nil); resp.StatusCode != http.StatusOK || !bytes.Equal(got, okData) {
+		t.Fatalf("GET ok after corrupt reads: %s", resp.Status)
+	}
+
+	// DELETE on a corrupt row doesn't panic in unindex and leaves shards_by_store untouched.
+	e.mustPut("del", random(10<<10))
+	f := e.file("del")
+	bad := *f
+	bad.Stores = append(slices.Clone(f.Stores), f.Stores...)
+	e.db.PutFile(ctx, &bad)
+	if resp, _ := e.do("DELETE", "del", nil); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("DELETE corrupt: %s", resp.Status)
+	}
+	e.sv.unindex(ctx, &bad)
+	if have, want := e.rows(f); have != want {
+		t.Errorf("unindex deleted shards of corrupt row: %d of %d rows left", have, want)
+	}
+}
+
+func TestRepairSkipsCorruptMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*db.File)
+	}{
+		{"doubled", func(f *db.File) {
+			pad := make([]db.UUID, len(f.Stores))
+			for i := range pad {
+				pad[i], _ = db.NewID()
+			}
+			f.Stores = append(pad, f.Stores...)
+		}},
+		{"short", func(f *db.File) { f.Stores = f.Stores[:2] }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t, 13)
+			ctx := context.Background()
+			e.db.Clock = func() time.Time { return time.Now().Add(-25 * time.Hour) }
+			e.mustPut("bad", random(10<<10))
+			e.db.Clock = nil
+			orig := e.file("bad")
+			bad := *orig
+			bad.Stores = slices.Clone(orig.Stores)
+			tc.mutate(&bad)
+			e.db.PutFile(ctx, &bad)
+
+			n := e.node(orig.Stores[0])
+			e.kill(n)
+			e.db.Heartbeat(ctx, db.Store{ID: n.id, Addr: n.addr, LastSeen: time.Now().Add(-25 * time.Hour)})
+			e.reload()
+
+			if err := e.sv.Repair(ctx, 24*time.Hour); err != nil {
+				t.Fatal(err)
+			}
+			if got := metric(e.sv.Metrics, "filescale_repair_errors_total"); got != 1 {
+				t.Errorf("repair_errors = %v, want 1", got)
+			}
+			if have, want := e.rows(orig); have != want {
+				t.Errorf("repair dropped shards of corrupt row: %d of %d rows left", have, want)
+			}
+		})
+	}
+}
+
 // Losing more stores than parity mid-download cuts the body off: the client gets an error
 // after a correct prefix, never wrong bytes.
 func TestDownloadCutOff(t *testing.T) {

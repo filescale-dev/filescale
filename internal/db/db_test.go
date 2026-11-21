@@ -161,6 +161,74 @@ func TestBucket(t *testing.T) {
 	}
 }
 
+func TestCheckLayout(t *testing.T) {
+	uuids := func(n int) []UUID {
+		s := make([]UUID, n)
+		for i := range s {
+			s[i] = newID(t)
+		}
+		return s
+	}
+	valid := []struct {
+		name string
+		f    File
+	}{
+		{"empty", File{Size: 0, DataShards: 1, ParityShards: 4}},
+		{"empty non-nil slices", File{Size: 0, DataShards: 1, ParityShards: 4, Stores: []UUID{}, Parts: []UUID{}}},
+		{"single 1+4", File{Size: 100, DataShards: 1, ParityShards: 4, Stores: uuids(5)}},
+		{"single 8+4", File{Size: 1 << 20, DataShards: 8, ParityShards: 4, Stores: uuids(12)}},
+		{"single empty parts slice", File{Size: 100, DataShards: 1, ParityShards: 0, Stores: uuids(1), Parts: []UUID{}}},
+		{"multi exact", File{Size: 20, PartSize: 10, DataShards: 1, ParityShards: 4, Parts: uuids(2), Stores: uuids(10)}},
+		{"multi partial tail", File{Size: 15, PartSize: 10, DataShards: 8, ParityShards: 4, Parts: uuids(2), Stores: uuids(24)}},
+	}
+	for _, tc := range valid {
+		if err := tc.f.CheckLayout(); err != nil {
+			t.Errorf("%s: got %v, want nil", tc.name, err)
+		}
+	}
+
+	invalid := []struct {
+		name string
+		f    File
+	}{
+		{"negative size", File{Size: -1, DataShards: 1, ParityShards: 4}},
+		{"zero data shards", File{Size: 10, DataShards: 0, ParityShards: 4, Stores: uuids(4)}},
+		{"negative data shards", File{Size: 10, DataShards: -1, ParityShards: 4}},
+		{"negative parity", File{Size: 10, DataShards: 1, ParityShards: -1}},
+		{"empty with stores", File{Size: 0, DataShards: 1, ParityShards: 4, Stores: uuids(5)}},
+		{"empty with parts", File{Size: 0, DataShards: 1, ParityShards: 4, Parts: uuids(1)}},
+		{"empty with part size", File{Size: 0, DataShards: 1, ParityShards: 4, PartSize: 10}},
+		{"non-empty no stores", File{Size: 10, DataShards: 1, ParityShards: 4}},
+		{"doubled stores 1+4", File{Size: 76 << 10, DataShards: 1, ParityShards: 4, Stores: uuids(10)}},
+		{"doubled stores 8+4", File{Size: 1 << 20, DataShards: 8, ParityShards: 4, Stores: uuids(24)}},
+		{"truncated stores", File{Size: 100, DataShards: 1, ParityShards: 4, Stores: uuids(3)}},
+		{"single with part size", File{Size: 100, DataShards: 1, ParityShards: 4, Stores: uuids(5), PartSize: 10}},
+		{"multi zero part size", File{Size: 15, DataShards: 1, ParityShards: 4, Parts: uuids(2), Stores: uuids(10)}},
+		{"multi negative part size", File{Size: 15, PartSize: -10, DataShards: 1, ParityShards: 4, Parts: uuids(2), Stores: uuids(10)}},
+		{"multi too few parts", File{Size: 25, PartSize: 10, DataShards: 1, ParityShards: 4, Parts: uuids(2), Stores: uuids(10)}},
+		{"multi too many parts", File{Size: 10, PartSize: 10, DataShards: 1, ParityShards: 4, Parts: uuids(2), Stores: uuids(10)}},
+		{"multi short stores", File{Size: 15, PartSize: 10, DataShards: 1, ParityShards: 4, Parts: uuids(2), Stores: uuids(9)}},
+		{"multi doubled stores", File{Size: 15, PartSize: 10, DataShards: 1, ParityShards: 4, Parts: uuids(2), Stores: uuids(20)}},
+	}
+	for _, tc := range invalid {
+		if err := tc.f.CheckLayout(); err == nil {
+			t.Errorf("%s: got nil, want error", tc.name)
+		}
+	}
+}
+
+func TestMemSetShardStoreBounds(t *testing.T) {
+	m := NewMem()
+	ctx := context.Background()
+	id, s1 := newID(t), newID(t)
+	m.PutFile(ctx, &File{Name: "f", ID: id, Size: 10, DataShards: 1, Stores: []UUID{s1}})
+	for _, shard := range []int{-1, 1, 5} {
+		if ok, err := m.SetShardStore(ctx, "f", id, shard, s1); ok || err == nil {
+			t.Errorf("shard %d: ok=%v err=%v, want error", shard, ok, err)
+		}
+	}
+}
+
 // Mem hides upload rows past UploadTTL, like Cassandra's TTL on the uploads table.
 func TestMemTTLOfUploads(t *testing.T) {
 	m := NewMem()

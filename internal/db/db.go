@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"time"
 
@@ -25,10 +26,49 @@ type File struct {
 
 func (f *File) NumParts() int { return max(1, len(f.Parts)) }
 
+// CheckLayout reports whether f's size, shards, parts and stores agree.
+func (f *File) CheckLayout() error {
+	if f.Size < 0 {
+		return fmt.Errorf("negative size %d", f.Size)
+	}
+	if f.DataShards <= 0 || f.ParityShards < 0 {
+		return fmt.Errorf("bad shard counts %d+%d", f.DataShards, f.ParityShards)
+	}
+	if f.Size == 0 {
+		if len(f.Stores) != 0 || len(f.Parts) != 0 || f.PartSize != 0 {
+			return fmt.Errorf("empty file has %d stores, %d parts, part_size %d", len(f.Stores), len(f.Parts), f.PartSize)
+		}
+		return nil
+	}
+	n := f.DataShards + f.ParityShards
+	if n <= 0 {
+		return fmt.Errorf("bad shard counts %d+%d", f.DataShards, f.ParityShards)
+	}
+	if len(f.Parts) == 0 {
+		if f.PartSize != 0 {
+			return fmt.Errorf("single-part file has part_size %d", f.PartSize)
+		}
+		if len(f.Stores) != n {
+			return fmt.Errorf("stores %d != %d", len(f.Stores), n)
+		}
+		return nil
+	}
+	if f.PartSize <= 0 {
+		return fmt.Errorf("non-positive part_size %d", f.PartSize)
+	}
+	if want := (f.Size-1)/f.PartSize + 1; want != int64(len(f.Parts)) {
+		return fmt.Errorf("parts %d != %d", len(f.Parts), want)
+	}
+	if want := int64(len(f.Parts)) * int64(n); int64(len(f.Stores)) != want {
+		return fmt.Errorf("stores %d != %d", len(f.Stores), want)
+	}
+	return nil
+}
+
 // Part is part i as a file of its own, what reads, repair and scrub work on.
 func (f *File) Part(i int) *File {
 	p := *f
-	if f.Parts == nil {
+	if len(f.Parts) == 0 {
 		return &p
 	}
 	n := f.DataShards + f.ParityShards
@@ -41,7 +81,7 @@ func (f *File) Part(i int) *File {
 
 // PartOf is the index of the part stored under id, -1 if it isn't one of f's.
 func (f *File) PartOf(id UUID) int {
-	if f.Parts == nil {
+	if len(f.Parts) == 0 {
 		if id == f.ID {
 			return 0
 		}

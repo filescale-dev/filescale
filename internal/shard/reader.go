@@ -78,6 +78,15 @@ type result struct {
 }
 
 func NewReader(ctx context.Context, c *Client, f *db.File, addrs []string, first, last int64) (*Reader, error) {
+	if err := f.CheckLayout(); err != nil {
+		return nil, err
+	}
+	if f.Size == 0 || len(f.Parts) > 0 {
+		return nil, errors.New("reader expects one non-empty part")
+	}
+	if len(addrs) != len(f.Stores) {
+		return nil, fmt.Errorf("addrs %d != stores %d", len(addrs), len(f.Stores))
+	}
 	enc, err := erasure.New(f.DataShards, f.ParityShards) // 1 data shard: every parity shard is a plain copy
 	if err != nil {
 		return nil, err

@@ -42,6 +42,11 @@ func (s *Serve) download(w http.ResponseWriter, r *http.Request, name string) {
 		http.NotFound(w, r)
 		return
 	}
+	if err := f.CheckLayout(); err != nil {
+		log.Printf("download %s: corrupt metadata: %v", name, err)
+		http.Error(w, "corrupt file metadata", http.StatusInternalServerError)
+		return
+	}
 	// always set: without it ServeContent reads 512 bytes and seeks back, reopening every shard
 	w.Header().Set("Content-Type", f.ContentType)
 	w.Header().Set("X-Content-Type-Options", "nosniff")

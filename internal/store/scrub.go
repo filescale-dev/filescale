@@ -256,13 +256,22 @@ func (s *Store) scrubShard(ctx context.Context, d *disk, row db.Shard, buf []byt
 	if err != nil {
 		return 0, err
 	}
+	if f != nil {
+		if err := f.CheckLayout(); err != nil {
+			return 0, fmt.Errorf("corrupt metadata for %s: %w", row.Name, err)
+		}
+	}
 	k := row.Index
 	orphan := func(f *db.File) bool {
-		i := -1
-		if f != nil {
-			i = f.PartOf(row.FileID)
+		if f == nil || k < 0 {
+			return true
 		}
-		return i < 0 || k < 0 || k >= f.DataShards+f.ParityShards || f.Part(i).Stores[k] != d.id
+		i := f.PartOf(row.FileID)
+		if i < 0 {
+			return true
+		}
+		p := f.Part(i)
+		return k >= len(p.Stores) || p.Stores[k] != d.id
 	}
 	if orphan(f) {
 		if time.Since(row.Written) <= young {
@@ -271,6 +280,11 @@ func (s *Store) scrubShard(ctx context.Context, d *disk, row db.Shard, buf []byt
 		// a replica without the file row yet would have a live shard look orphaned
 		if f, err = s.DB.File(db.All(ctx), row.Name); err != nil {
 			return 0, err
+		}
+		if f != nil {
+			if err := f.CheckLayout(); err != nil {
+				return 0, fmt.Errorf("corrupt metadata for %s: %w", row.Name, err)
+			}
 		}
 		if orphan(f) {
 			log.Printf("scrub: dropping orphan row %s on %s", row.FileID, d.id)

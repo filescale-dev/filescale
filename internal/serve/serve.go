@@ -198,9 +198,19 @@ func (s *Serve) delete(w http.ResponseWriter, r *http.Request, name string) {
 // Not for parts the name still holds (a newer write lost to clock skew, or a resent last part
 // sharing the rest), orphan checks catch the rest.
 func (s *Serve) unindex(ctx context.Context, f *db.File) {
+	if err := f.CheckLayout(); err != nil {
+		log.Printf("unindex %s: corrupt metadata: %v", f.Name, err)
+		return
+	}
 	cur, err := s.DB.File(ctx, f.Name)
 	if err != nil {
 		return
+	}
+	if cur != nil {
+		if err := cur.CheckLayout(); err != nil {
+			log.Printf("unindex %s: corrupt current metadata: %v", f.Name, err)
+			return
+		}
 	}
 	for i := range f.NumParts() {
 		p := f.Part(i)

@@ -585,6 +585,43 @@ func TestScrubOrphanRows(t *testing.T) {
 	}
 }
 
+func TestScrubSkipsCorruptMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		stores func(db.UUID) []db.UUID
+	}{
+		{"doubled", func(id db.UUID) []db.UUID {
+			return []db.UUID{newID(t), newID(t), newID(t), newID(t), newID(t), id, newID(t), newID(t), newID(t), newID(t)}
+		}},
+		{"short", func(id db.UUID) []db.UUID { return []db.UUID{id, newID(t)} }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, m := newStore(t, 5)
+			d := s.list[0]
+			ctx := context.Background()
+			fid := newID(t)
+			path := writeShardFile(t, d, fid, 0, time.Now().Add(-25*time.Hour))
+			m.PutFile(ctx, &db.File{Name: "bad", ID: fid, Size: 100, DataShards: 1, ParityShards: 4, Stores: tc.stores(d.id)})
+			m.Clock = func() time.Time { return time.Now().Add(-25 * time.Hour) }
+			m.PutShard(ctx, db.Shard{StoreID: d.id, FileID: fid, Index: 0, Name: "bad"})
+			m.Clock = nil
+
+			if err := s.Scrub(ctx, false, time.Time{}); err != nil {
+				t.Fatal(err)
+			}
+			if !hasRow(m, d.id, fid) {
+				t.Error("scrub dropped shards_by_store row of corrupt file")
+			}
+			if !exists(path) {
+				t.Error("scrub removed shard file of corrupt file")
+			}
+			if got := metric(s.Metrics, "filescale_scrub_orphan_rows_total"+diskLabels(d)); got != 0 {
+				t.Errorf("orphan rows = %v, want 0", got)
+			}
+		})
+	}
+}
+
 func TestScrubFailedMissingLeavesNoFile(t *testing.T) {
 	s, _, m := newStore(t, 5)
 	d := s.list[0]

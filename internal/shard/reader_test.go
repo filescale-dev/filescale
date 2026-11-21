@@ -243,6 +243,26 @@ func TestReaderRetriesReset(t *testing.T) {
 	}
 }
 
+func TestNewReaderRejectsBadLayout(t *testing.T) {
+	ctx, c := context.Background(), NewClient("")
+	cases := []struct {
+		name  string
+		f     *db.File
+		addrs []string
+	}{
+		{"doubled stores", &db.File{Size: 100, DataShards: 1, ParityShards: 4, Stores: make([]db.UUID, 10)}, make([]string, 5)},
+		{"short stores", &db.File{Size: 100, DataShards: 1, ParityShards: 4, Stores: make([]db.UUID, 3)}, make([]string, 3)},
+		{"addrs mismatch", &db.File{Size: 100, DataShards: 1, ParityShards: 4, Stores: make([]db.UUID, 5)}, make([]string, 4)},
+		{"empty file", &db.File{Size: 0, DataShards: 1, ParityShards: 4}, nil},
+		{"multi-part", &db.File{Size: 15, PartSize: 10, DataShards: 1, ParityShards: 0, Parts: make([]db.UUID, 2), Stores: make([]db.UUID, 2)}, make([]string, 2)},
+	}
+	for _, tc := range cases {
+		if _, err := NewReader(ctx, c, tc.f, tc.addrs, 0, 0); err == nil {
+			t.Errorf("%s: got nil, want error", tc.name)
+		}
+	}
+}
+
 func seq(n int) []int {
 	s := make([]int, n)
 	for i := range s {

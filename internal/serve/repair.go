@@ -97,12 +97,21 @@ func (s *Serve) repairFile(ctx context.Context, rows []db.Shard) error {
 	if err != nil {
 		return err
 	}
+	if f != nil {
+		if err := f.CheckLayout(); err != nil {
+			return fmt.Errorf("corrupt metadata: %w", err)
+		}
+	}
 	orphan := func(f *db.File, r db.Shard) bool {
 		if f == nil {
 			return true
 		}
 		pi := f.PartOf(r.FileID)
-		return pi < 0 || r.Index < 0 || r.Index >= f.DataShards+f.ParityShards || f.Part(pi).Stores[r.Index] != r.StoreID
+		if pi < 0 || r.Index < 0 {
+			return true
+		}
+		p := f.Part(pi)
+		return r.Index >= len(p.Stores) || p.Stores[r.Index] != r.StoreID
 	}
 	var stale bool
 	for _, r := range rows {
@@ -115,6 +124,11 @@ func (s *Serve) repairFile(ctx context.Context, rows []db.Shard) error {
 		// a replica without the file row yet would have a live shard look orphaned
 		if f, err = s.DB.File(db.All(ctx), rows[0].Name); err != nil {
 			return err
+		}
+		if f != nil {
+			if err := f.CheckLayout(); err != nil {
+				return fmt.Errorf("corrupt metadata: %w", err)
+			}
 		}
 	}
 	var lost []db.Shard

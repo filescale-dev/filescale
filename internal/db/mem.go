@@ -3,6 +3,7 @@ package db
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"slices"
 	"sync"
 	"time"
@@ -99,6 +100,9 @@ func (m *Mem) SetShardStore(_ context.Context, name string, fileID UUID, shard i
 	f, ok := m.files[name]
 	if !ok || f.ID != fileID {
 		return false, nil
+	}
+	if shard < 0 || shard >= len(f.Stores) {
+		return false, fmt.Errorf("shard %d out of range [0,%d)", shard, len(f.Stores))
 	}
 	f.Stores = slices.Clone(f.Stores)
 	f.Stores[shard] = store
