@@ -92,9 +92,12 @@ func storeFlags(fs *flag.FlagSet) *storeOpts {
 	return o
 }
 
-// listVar defines a comma-separated list flag. Set *p beforehand for a default.
 func listVar(fs *flag.FlagSet, p *[]string, name, usage string) {
 	fs.Func(name, usage, func(s string) error {
+		if s == "" {
+			*p = nil
+			return nil
+		}
 		*p = strings.Split(s, ",")
 		return nil
 	})
@@ -193,9 +196,10 @@ func runServe(c *commonOpts, o *serveOpts) {
 		},
 		Serves: func() ([]string, string) { return cluster.Addrs(ml, "serve"), cluster.Addr(ml, o.port) },
 	})
-	go sv.Run(context.Background(), o.repairAfter)
+	bg, stopBg := context.WithCancel(context.Background())
+	go sv.Run(bg, o.repairAfter)
 	serveMetrics(c, sv.Metrics)
-	listen(c, o.port, sv, ml)
+	listen(c, o.port, sv, ml, stopBg)
 }
 
 func runStore(c *commonOpts, o *storeOpts) {
@@ -213,9 +217,10 @@ func runStore(c *commonOpts, o *storeOpts) {
 		log.Fatal(err)
 	}
 	log.Printf("store_ids: %v", st.IDs())
-	go st.Run(context.Background(), cluster.Addr(ml, o.port))
+	bg, stopBg := context.WithCancel(context.Background())
+	go st.Run(bg, cluster.Addr(ml, o.port))
 	serveMetrics(c, st.Metrics)
-	listen(c, o.port, st, ml)
+	listen(c, o.port, st, ml, stopBg)
 }
 
 // join starts memberlist and a store client whose waits stretch with each store's round trip.
@@ -239,7 +244,7 @@ func connect(c *commonOpts) *db.Cassandra {
 	return d
 }
 
-func listen(c *commonOpts, port int, h http.Handler, ml *memberlist.Memberlist) {
+func listen(c *commonOpts, port int, h http.Handler, ml *memberlist.Memberlist, stopBg context.CancelFunc) {
 	srv := &http.Server{
 		Addr:              net.JoinHostPort(c.ip, strconv.Itoa(port)),
 		Handler:           h,
@@ -259,6 +264,9 @@ func listen(c *commonOpts, port int, h http.Handler, ml *memberlist.Memberlist) 
 	log.Printf("listening on %s, %d cluster members", srv.Addr, ml.NumMembers())
 	<-ctx.Done()
 	stop() // a second signal kills right away
+	if stopBg != nil {
+		stopBg()
+	}
 	log.Printf("shutting down, waiting up to %v for requests in flight", drainWait)
 	ml.Leave(5 * time.Second) // peers stop sending here now instead of in ~30s
 	dctx, cancel := context.WithTimeout(context.Background(), drainWait)

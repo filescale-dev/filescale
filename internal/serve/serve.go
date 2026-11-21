@@ -231,11 +231,11 @@ func (s *Serve) pick(n int, size int64, skip map[string]bool, prefer []db.UUID) 
 		return nil, &statusError{http.StatusInsufficientStorage, fmt.Sprintf("need %d servers with %d bytes free, %d have it", n, size, len(roomy))}
 	}
 	// weights capped at twice the average, or an empty new server is in nearly every upload
-	var sum int64
+	var sum float64
 	for _, st := range room {
-		sum += st.Free
+		sum += float64(st.Free)
 	}
-	limit := 2 * sum / int64(len(room))
+	limit := 2 * sum / float64(len(room))
 	var picked []db.Store
 	used := map[string]bool{}
 	for _, id := range prefer {
@@ -246,19 +246,20 @@ func (s *Serve) pick(n int, size int64, skip map[string]bool, prefer []db.UUID) 
 			}
 		}
 	}
+	weight := func(st db.Store) float64 { return max(1, min(float64(st.Free), limit)) }
 	for len(picked) < n {
-		var total int64
+		var total float64
 		for _, st := range room {
 			if !used[st.Addr] {
-				total += min(st.Free, limit)
+				total += weight(st)
 			}
 		}
-		x := rand.Int64N(total)
+		x := rand.Float64() * total
 		for _, st := range room {
 			if used[st.Addr] {
 				continue
 			}
-			w := min(st.Free, limit)
+			w := weight(st)
 			if x < w {
 				picked = append(picked, st)
 				used[st.Addr] = true

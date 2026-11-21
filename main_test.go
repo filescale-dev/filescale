@@ -76,7 +76,7 @@ func TestListenDrains(t *testing.T) {
 		})
 		returned := make(chan struct{})
 		go func() {
-			listen(&commonOpts{ip: "127.0.0.1"}, port, h, ml)
+			listen(&commonOpts{ip: "127.0.0.1"}, port, h, ml, nil)
 			close(returned)
 		}()
 		got := make(chan error, 1)
@@ -142,6 +142,7 @@ func TestListFlags(t *testing.T) {
 		dirs      []string
 	}{
 		{nil, nil, []string{"127.0.0.1"}, []string{"./data"}},
+		{[]string{"-peers="}, nil, []string{"127.0.0.1"}, []string{"./data"}},
 		{
 			[]string{"-peers=a:7946,b:7946", "-cassandra=c1,c2,c3", "-dir=/d1,/d2"},
 			[]string{"a:7946", "b:7946"}, []string{"c1", "c2", "c3"}, []string{"/d1", "/d2"},

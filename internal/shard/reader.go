@@ -260,6 +260,7 @@ func (r *Reader) recv(k int) []byte {
 				return nil
 			}
 			log.Printf("file %s shard %d stripe %d on store %s: %v, retrying", r.f.ID, k, r.cur, r.f.Stores[k], res.err)
+			since = time.Time{}
 			r.open(k).retried = true // connection reset or stall: retry once
 			continue
 		}

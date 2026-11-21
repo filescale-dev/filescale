@@ -97,22 +97,29 @@ func (s *Serve) repairFile(ctx context.Context, rows []db.Shard) error {
 	if err != nil {
 		return err
 	}
-	pi := -1 // the part these rows are shards of
-	if f != nil {
-		pi = f.PartOf(rows[0].FileID)
+	orphan := func(f *db.File, r db.Shard) bool {
+		if f == nil {
+			return true
+		}
+		pi := f.PartOf(r.FileID)
+		return pi < 0 || r.Index < 0 || r.Index >= f.DataShards+f.ParityShards || f.Part(pi).Stores[r.Index] != r.StoreID
 	}
-	if pi < 0 && time.Since(rows[0].Written) > 24*time.Hour {
+	var stale bool
+	for _, r := range rows {
+		if orphan(f, r) && time.Since(r.Written) > 24*time.Hour {
+			stale = true
+			break
+		}
+	}
+	if stale {
 		// a replica without the file row yet would have a live shard look orphaned
 		if f, err = s.DB.File(db.All(ctx), rows[0].Name); err != nil {
 			return err
 		}
-		if f != nil {
-			pi = f.PartOf(rows[0].FileID)
-		}
 	}
 	var lost []db.Shard
 	for _, r := range rows {
-		if pi < 0 { // orphan: lost an overwrite race or a delete crashed
+		if orphan(f, r) {
 			if time.Since(r.Written) > 24*time.Hour {
 				s.DB.DeleteShard(ctx, r.StoreID, r.FileID)
 			}
@@ -123,6 +130,7 @@ func (s *Serve) repairFile(ctx context.Context, rows []db.Shard) error {
 	if len(lost) == 0 {
 		return nil
 	}
+	pi := f.PartOf(lost[0].FileID)
 
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)

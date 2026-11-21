@@ -944,6 +944,16 @@ func TestPickCap(t *testing.T) {
 	if hits < 600 || hits > 1200 {
 		t.Errorf("new server in %d of 2000 uploads", hits)
 	}
+
+	// huge free values must not overflow int64 weight sums
+	huge := make([]db.Store, 12)
+	for i := range huge {
+		huge[i] = db.Store{Addr: fmt.Sprint(i), Free: 1 << 60, LastSeen: time.Now()}
+	}
+	s.stores.Store(&huge)
+	if picked, err := s.pick(12, 1, nil, nil); err != nil || len(picked) != 12 {
+		t.Errorf("huge Free pick: %d, %v", len(picked), err)
+	}
 }
 
 // A store not seen for 3 minutes is out of uploads even if memberlist still lists it.
@@ -1371,6 +1381,35 @@ func TestRepairDropsOrphans(t *testing.T) {
 	}
 	if e.hasRow(n.id, orphan) {
 		t.Error("orphan row kept")
+	}
+}
+
+func TestRepairDropsStaleMovedRow(t *testing.T) {
+	e := newEnv(t, 13)
+	ctx := context.Background()
+	data := random(100 << 10)
+	e.mustPut("moved", data)
+	f := e.file("moved")
+	var spare *node
+	for _, n := range e.nodes {
+		if !slices.Contains(f.Stores, n.id) {
+			spare = n
+		}
+	}
+	// Stale row on a down store for a shard that now lives on another store.
+	e.kill(spare)
+	e.db.Heartbeat(ctx, db.Store{ID: spare.id, Addr: spare.addr, LastSeen: time.Now().Add(-25 * time.Hour)})
+	e.db.Clock = func() time.Time { return time.Now().Add(-25 * time.Hour) }
+	e.db.PutShard(ctx, db.Shard{StoreID: spare.id, FileID: f.ID, Index: 0, Name: "moved"})
+	e.db.Clock = nil
+	if err := e.sv.Repair(ctx, 24*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if e.hasRow(spare.id, f.ID) {
+		t.Error("stale row on down store kept")
+	}
+	if !slices.Equal(e.file("moved").Stores, f.Stores) {
+		t.Error("repair moved a healthy shard because of a stale row")
 	}
 }
 
