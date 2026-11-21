@@ -1,3 +1,5 @@
+fornaxian.tech/zerodown v0.0.0-20230523212539-9235749ce137 h1:oWdl/4epjfCZPORcwegmstmDmj5HutaxEHh0skfgA0A=
+fornaxian.tech/zerodown v0.0.0-20230523212539-9235749ce137/go.mod h1:6AG7NtrIPAGR8hkyZiZSj3izsArpo1ufQYRuzUwMvu0=
 github.com/apache/cassandra-gocql-driver/v2 v2.1.2 h1:lu/p0Db2av18enHJvWJQoChLssI0P+AR06STq4VdvCc=
 github.com/apache/cassandra-gocql-driver/v2 v2.1.2/go.mod h1:QH/asJjB3mHvY6Dot6ZKMMpTcOrWJ8i9GhsvG1g0PK4=
 github.com/golang/snappy v0.0.4 h1:yAGX7huGHXlcLOEtBnF4w7FQwA26wojNCwOYAEhLjQM=

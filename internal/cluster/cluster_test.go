@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -37,12 +38,80 @@ func TestJoin(t *testing.T) {
 // Join keeps trying while alone: a peer that comes up later is joined within its 5s.
 func TestJoinRetries(t *testing.T) {
 	a := node(t, 17952, "", Meta{Role: "serve"})
-	go Join(a, []string{"127.0.0.1:17953"}) // not up yet
+	go Join(t.Context(), a, []string{"127.0.0.1:17953"}) // not up yet
 	time.Sleep(time.Second)
 	node(t, 17953, "", Meta{Role: "store"})
 	for start := time.Now(); a.NumMembers() < 2; time.Sleep(100 * time.Millisecond) {
 		if time.Since(start) > 8*time.Second {
 			t.Fatal("never joined the peer that came up late")
+		}
+	}
+}
+
+func TestAddrsDeduplicates(t *testing.T) {
+	a := node(t, 17960, "", Meta{Role: "serve", Port: 8080})
+	b := node(t, 17961, "", Meta{Role: "serve", Port: 8080})
+	if _, err := b.Join([]string{"127.0.0.1:17960"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := Addrs(a, "serve"); !slices.Equal(got, []string{"127.0.0.1:8080"}) {
+		t.Errorf("serve addrs = %v, want 1 deduplicated entry", got)
+	}
+}
+
+func TestAliveStoreAddrsAfterLeaveAndShutdown(t *testing.T) {
+	node(t, 17962, "", Meta{Role: "store", Port: 8081})
+	sv, err := New("127.0.0.1", 17963, "", Meta{Role: "serve", Port: 8080}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { sv.Shutdown() })
+	if _, err := sv.Join([]string{"127.0.0.1:17962"}); err != nil {
+		t.Fatal(err)
+	}
+	Leave(sv, time.Second)
+	_ = sv.Shutdown()
+	if got := AliveStoreAddrs(sv); !got["127.0.0.1:8081"] {
+		t.Errorf("alive store addrs after shutdown = %v", got)
+	}
+}
+
+func TestReusePortHandoff(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("SO_REUSEPORT is Unix-only")
+	}
+	sv := node(t, 17964, "", Meta{Role: "serve", Port: 8080})
+	oldSt, err := New("127.0.0.1", 17965, "", Meta{Role: "store", Port: 8081}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { oldSt.Shutdown() })
+	if _, err := oldSt.Join([]string{"127.0.0.1:17964"}); err != nil {
+		t.Fatal(err)
+	}
+	newSt, err := New("127.0.0.1", 17965, "", Meta{Role: "store", Port: 8081}, nil)
+	if err != nil {
+		t.Fatalf("second bind on same gossipPort: %v", err)
+	}
+	t.Cleanup(func() { newSt.Shutdown() })
+	if _, err := newSt.Join([]string{"127.0.0.1:17964"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := Addrs(sv, "store"); len(got) != 1 {
+		t.Fatalf("store addrs during overlap = %v", got)
+	}
+
+	Leave(oldSt, time.Second)
+	_ = oldSt.Shutdown()
+	if !AliveStoreAddrs(sv)["127.0.0.1:8081"] {
+		t.Fatal("store vanished during reload handoff")
+	}
+
+	Leave(newSt, time.Second)
+	_ = newSt.Shutdown()
+	for start := time.Now(); AliveStoreAddrs(sv)["127.0.0.1:8081"]; time.Sleep(20 * time.Millisecond) {
+		if time.Since(start) > 3*time.Second {
+			t.Fatal("store still alive after full stop")
 		}
 	}
 }

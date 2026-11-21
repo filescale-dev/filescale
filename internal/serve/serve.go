@@ -76,8 +76,10 @@ func (s *Serve) Reload(ctx context.Context) error {
 }
 
 func (s *Serve) Run(ctx context.Context, repairAfter time.Duration) {
-	if err := s.Reload(ctx); err != nil {
-		log.Printf("stores: %v", err)
+	if s.reloaded.Load() == 0 {
+		if err := s.Reload(ctx); err != nil {
+			log.Printf("stores: %v", err)
+		}
 	}
 	// own goroutine: a long repair must not stall the reload, pick skips stores not seen for 3 min
 	go func() {

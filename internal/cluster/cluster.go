@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -16,6 +17,8 @@ import (
 
 	"github.com/hashicorp/memberlist"
 )
+
+var nodeSeq atomic.Uint64
 
 // Meta is gossiped with every node so others find its HTTP port and settings.
 type Meta struct {
@@ -38,7 +41,6 @@ func New(ip string, port int, secret string, meta Meta, rtt *RTT) (*memberlist.M
 	if rtt != nil {
 		cfg.Ping = rtt
 	}
-	cfg.Name = fmt.Sprintf("%s:%d", host, port)
 	cfg.BindPort = port
 	cfg.AdvertisePort = port
 	if ip != "" {
@@ -58,32 +60,84 @@ func New(ip string, port int, secret string, meta Meta, rtt *RTT) (*memberlist.M
 	cfg.Delegate = delegate(b)
 	ev := newEvents(meta)
 	cfg.Events = ev
-	cfg.LogOutput = quiet{}
+	logger := log.New(quiet{}, "", log.LstdFlags)
+	cfg.Logger = logger
+	tr, err := newReuseTransport(cfg.BindAddr, cfg.BindPort, logger)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.BindPort == 0 {
+		cfg.BindPort = tr.GetAutoBindPort()
+		cfg.AdvertisePort = cfg.BindPort
+	}
+	cfg.Name = fmt.Sprintf("%s:%d-%d-%d", host, cfg.BindPort, os.Getpid(), nodeSeq.Add(1))
+	cfg.Transport = tr
 	ml, err := memberlist.Create(cfg)
 	if err != nil {
+		_ = tr.Shutdown()
 		return nil, err
 	}
 	ev.attach(ml)
 	return ml, nil
 }
 
+// JoinOnce tries one peer join, bounded by wait.
+func JoinOnce(ml *memberlist.Memberlist, peers []string, wait time.Duration) {
+	if len(peers) == 0 {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		joinStep(ml, peers)
+	}()
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+	}
+}
+
 // Join joins peers every 5s while alone, then every minute: memberlist stops contacting
 // a node it marked dead after 60s, so a longer network cut would stay split until a restart.
-func Join(ml *memberlist.Memberlist, peers []string) {
-	for len(peers) > 0 {
-		before := ml.NumMembers()
-		if _, err := ml.Join(peers); err != nil {
-			log.Printf("join %v: %v", peers, err)
+func Join(ctx context.Context, ml *memberlist.Memberlist, peers []string) {
+	if len(peers) == 0 {
+		return
+	}
+	if ml.NumMembers() > 1 && !sleepCtx(ctx, time.Minute) {
+		return
+	}
+	for ctx.Err() == nil {
+		joinStep(ml, peers)
+		wait := 5 * time.Second
+		if ml.NumMembers() > 1 {
+			wait = time.Minute
 		}
-		n := ml.NumMembers()
-		if n > before {
-			log.Printf("joined %v: %d → %d members", peers, before, n)
+		if !sleepCtx(ctx, wait) {
+			return
 		}
-		if n > 1 {
-			time.Sleep(time.Minute)
-		} else {
-			time.Sleep(5 * time.Second)
-		}
+	}
+}
+
+func joinStep(ml *memberlist.Memberlist, peers []string) {
+	before := ml.NumMembers()
+	if _, err := ml.Join(peers); err != nil {
+		log.Printf("join %v: %v", peers, err)
+	}
+	if n := ml.NumMembers(); n > before {
+		log.Printf("joined %v: %d → %d members", peers, before, n)
+	}
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
 	}
 }
 
@@ -101,13 +155,18 @@ func Addr(ml *memberlist.Memberlist, port int) string {
 	return net.JoinHostPort(ml.LocalNode().Addr.String(), strconv.Itoa(port))
 }
 
-// Addrs lists the HTTP addresses of live members with the given role.
+// Addrs lists the unique HTTP addresses of live members with the given role.
 func Addrs(ml *memberlist.Memberlist, role string) []string {
+	seen := map[string]bool{}
 	var out []string
 	for _, n := range ml.Members() {
 		var m Meta
 		if json.Unmarshal(n.Meta, &m) == nil && m.Role == role {
-			out = append(out, net.JoinHostPort(n.Addr.String(), strconv.Itoa(m.Port)))
+			addr := net.JoinHostPort(n.Addr.String(), strconv.Itoa(m.Port))
+			if !seen[addr] {
+				seen[addr] = true
+				out = append(out, addr)
+			}
 		}
 	}
 	return out

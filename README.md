@@ -39,6 +39,7 @@ This project was written with heavy AI use, and validated by a human.
 - Pixeldrain's [pixelstore](https://www.patreon.com/pixeldrain/posts/erasure-coding-72493411) (Not associated with this project) - design choices and implementation
 - [klauspost/reedsolomon](https://github.com/klauspost/reedsolomon) - underlying library used for erasure coding
 - [hashicorp/memberlist](https://github.com/hashicorp/memberlist) - peer discovery
+- [Fornaxian/zerodown](https://github.com/Fornaxian/zerodown) - zero-downtime rolling restarts
 
 ## Requirements
 - Linux, Go 1.25+ to build
@@ -86,6 +87,7 @@ curl -X DELETE http://127.0.0.1:8080/photos/cat.jpg
 | `-replication` | 1 | keyspace replication factor, at creation only |
 | `-secret` | `$FILESCALE_SECRET`, else off | cluster secret |
 | `-metricsPort` | off | Prometheus `/metrics`, no auth |
+| `-drainWait` | 30s | how long shutdown waits for requests in flight |
 
 | serve | Default | |
 |---|---|---|
@@ -268,10 +270,13 @@ Files up to 64 MiB are one part and just get sent again. Unfinished uploads expi
   - Use `read_ahead_kb` set to 1-4 MiB on HDDs (the default is 128 KiB)
   - Keep `vm.dirty_bytes` low enough that unflushed data stays under a minute old under sustained writes
   - Use `mq-deadline` (the usual HDD default) as it keeps writeback from starving reads; try `bfq` if read latency still suffers while uploads run.
-- **Upgrades.** Upgrade stores first, then serves.
-- **Shutdown.** SIGTERM (or Ctrl-C) leaves the memberlist at once, so peers stop sending to this node immediately.
-  - filescale lets requests in flight finish for up to 30s.
-  - A second signal exits at once. On a rolling deploy send one signal per node and wait for it to exit.
+- **Upgrades (rolling restarts).** Upgrade stores first, then serves. filescale uses [`zerodown`](https://github.com/Fornaxian/zerodown), see the below on how to upgrade without traffic loss.
+  - Atomically replace the binary (`install -m 755 filescale.new /usr/local/bin/filescale` or `mv`; never `cp` over a running binary) and send `SIGHUP` to the parent (`kill -HUP <pid>` or `systemctl reload`).
+  - Changing flags requires a full restart.
+  - Under systemd, use `KillMode=control-group`, `KillSignal=SIGINT`, and `ExecReload=/bin/kill -HUP $MAINPID`.
+- **Shutdown.** `SIGTERM` or `SIGINT` (Ctrl-C) leaves the memberlist at once, so peers stop sending to this node immediately.
+  - filescale lets requests in flight finish for up to `-drainWait` (default 30s).
+  - A second signal to the child exits at once.
 
 ## Operations
 

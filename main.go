@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"fornaxian.tech/zerodown"
 	"github.com/hashicorp/memberlist"
 
 	"filescale/internal/cluster"
@@ -35,6 +36,7 @@ type commonOpts struct {
 	replication int
 	secret      string
 	metricsPort int
+	drainWait   time.Duration
 }
 
 type serveOpts struct {
@@ -66,6 +68,7 @@ func commonFlags(fs *flag.FlagSet) *commonOpts {
 	fs.IntVar(&o.replication, "replication", 1, "Cassandra keyspace replication factor, only used when creating the keyspace (1 for a single node)")
 	fs.StringVar(&o.secret, "secret", "", "shared cluster secret: encrypts gossip and authenticates store requests (empty = $FILESCALE_SECRET, else off)")
 	fs.IntVar(&o.metricsPort, "metricsPort", 0, "port for Prometheus metrics at /metrics, 0 = off; no auth, keep it on the private network")
+	fs.DurationVar(&o.drainWait, "drainWait", 30*time.Second, "how long a shutdown waits for requests in flight")
 	return o
 }
 
@@ -146,15 +149,100 @@ func main() {
 		fs.Parse(os.Args[2:])
 		fromEnv(&c.secret, "FILESCALE_SECRET")
 		fromEnv(&o.token, "FILESCALE_TOKEN")
+		if c.drainWait < 0 {
+			log.Fatalf("-drainWait %v: want >= 0", c.drainWait)
+		}
+		if _, err := erasure.New(o.dataShards, o.parityShards); err != nil {
+			log.Fatalf("-dataShards %d -parityShards %d: %v", o.dataShards, o.parityShards, err)
+		}
+		if o.smallFileSize == 0 {
+			o.smallFileSize = o.dataShards * (512 << 10) / max(o.parityShards, 1)
+		}
+		if supervise(c, o.port) {
+			return
+		}
 		runServe(c, o)
 	case "store":
 		o := storeFlags(fs)
 		fs.Parse(os.Args[2:])
 		fromEnv(&c.secret, "FILESCALE_SECRET")
+		if c.drainWait < 0 {
+			log.Fatalf("-drainWait %v: want >= 0", c.drainWait)
+		}
+		if o.minFreeSpace < 0 || o.minFreeSpace > 100 {
+			log.Fatalf("-minFreeSpace %d: want 0-100", o.minFreeSpace)
+		}
+		if supervise(c, o.port) {
+			return
+		}
 		runStore(c, o)
 	default:
 		usage()
 	}
+}
+
+func supervise(c *commonOpts, port int) bool {
+	if zerodown.IsParent() {
+		api, err := openFile(shard.Listen(net.JoinHostPort(c.ip, strconv.Itoa(port))))
+		if err != nil {
+			log.Fatal(err)
+		}
+		files := []*os.File{api}
+		vars := []string{"FILESCALE_API_FD=3", "FILESCALE_METRICS_FD="}
+		if c.metricsPort != 0 {
+			m, err := openFile(net.Listen("tcp", net.JoinHostPort(c.ip, strconv.Itoa(c.metricsPort))))
+			if err != nil {
+				api.Close()
+				log.Fatal(err)
+			}
+			files = append(files, m)
+			vars[1] = "FILESCALE_METRICS_FD=4"
+		}
+		zerodown.ExtraFiles = files
+		zerodown.ExtraVariables = vars
+		defer func() {
+			for _, f := range files {
+				f.Close()
+			}
+		}()
+	}
+	return zerodown.Init()
+}
+
+func openFile(ln net.Listener, err error) (*os.File, error) {
+	if err != nil {
+		return nil, err
+	}
+	defer ln.Close()
+	return ln.(*net.TCPListener).File()
+}
+
+func inheritedListener(env string) (net.Listener, error) {
+	s := os.Getenv(env)
+	if s == "" {
+		return nil, nil
+	}
+	fd, err := strconv.Atoi(s)
+	if err != nil {
+		return nil, fmt.Errorf("%s=%q: %w", env, s, err)
+	}
+	f := os.NewFile(uintptr(fd), env)
+	defer f.Close()
+	return net.FileListener(f)
+}
+
+func apiListener(c *commonOpts, port int) (net.Listener, int) {
+	ln, err := inheritedListener("FILESCALE_API_FD")
+	if err != nil {
+		log.Fatal(err)
+	}
+	if ln == nil {
+		ln, err = shard.Listen(net.JoinHostPort(c.ip, strconv.Itoa(port)))
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+	return ln, ln.Addr().(*net.TCPAddr).Port
 }
 
 func logCommon(cmd string, c *commonOpts) {
@@ -166,12 +254,8 @@ func logCommon(cmd string, c *commonOpts) {
 }
 
 func runServe(c *commonOpts, o *serveOpts) {
-	if _, err := erasure.New(o.dataShards, o.parityShards); err != nil {
-		log.Fatalf("-dataShards %d -parityShards %d: %v", o.dataShards, o.parityShards, err)
-	}
-	if o.smallFileSize == 0 {
-		o.smallFileSize = o.dataShards * (512 << 10) / max(o.parityShards, 1)
-	}
+	ln, port := apiListener(c, o.port)
+	o.port = port
 	logCommon("serve", c)
 	shown := *o
 	if shown.token == "" {
@@ -181,8 +265,11 @@ func runServe(c *commonOpts, o *serveOpts) {
 	}
 	log.Printf("serve: %+v", shown)
 
-	ml, client := join(c, cluster.Meta{Role: "serve", Port: o.port, DataShards: o.dataShards, ParityShards: o.parityShards, SmallFileSize: int64(o.smallFileSize)})
 	d := connect(c)
+	defer d.Close()
+	bg, stopBg := context.WithCancel(context.Background())
+	client, rtt := newClient(c.secret)
+	ml := join(bg, c, cluster.Meta{Role: "serve", Port: o.port, DataShards: o.dataShards, ParityShards: o.parityShards, SmallFileSize: int64(o.smallFileSize)}, rtt)
 	sv := serve.New(serve.Config{
 		DB: d, Client: client,
 		DataShards: o.dataShards, ParityShards: o.parityShards, SmallFileSize: int64(o.smallFileSize),
@@ -190,21 +277,23 @@ func runServe(c *commonOpts, o *serveOpts) {
 		Alive:  func() map[string]bool { return cluster.AliveStoreAddrs(ml) },
 		Serves: func() ([]string, string) { return cluster.Addrs(ml, "serve"), cluster.Addr(ml, o.port) },
 	})
-	bg, stopBg := context.WithCancel(context.Background())
+	if err := sv.Reload(bg); err != nil {
+		log.Printf("stores: %v", err)
+	}
 	go sv.Run(bg, o.repairAfter)
-	serveMetrics(c, sv.Metrics)
-	listen(c, o.port, sv, ml, stopBg)
+	metricsSrv := serveMetrics(c, sv.Metrics)
+	listen(c, ln, sv, ml, stopBg, metricsSrv)
 }
 
 func runStore(c *commonOpts, o *storeOpts) {
-	if o.minFreeSpace < 0 || o.minFreeSpace > 100 {
-		log.Fatalf("-minFreeSpace %d: want 0-100", o.minFreeSpace)
-	}
+	ln, port := apiListener(c, o.port)
+	o.port = port
 	logCommon("store", c)
 	log.Printf("store: %+v", *o)
 
-	ml, client := join(c, cluster.Meta{Role: "store", Port: o.port})
 	d := connect(c)
+	defer d.Close()
+	client, rtt := newClient(c.secret)
 	st, err := store.New(store.Config{Dirs: o.dirs, MinFree: int64(o.minFreeSpace), Token: cluster.APIToken(c.secret),
 		DB: d, Client: client})
 	if err != nil {
@@ -212,22 +301,27 @@ func runStore(c *commonOpts, o *storeOpts) {
 	}
 	log.Printf("store_ids: %v", st.IDs())
 	bg, stopBg := context.WithCancel(context.Background())
+	ml := join(bg, c, cluster.Meta{Role: "store", Port: o.port}, rtt)
 	go st.Run(bg, cluster.Addr(ml, o.port))
-	serveMetrics(c, st.Metrics)
-	listen(c, o.port, st, ml, stopBg)
+	metricsSrv := serveMetrics(c, st.Metrics)
+	listen(c, ln, st, ml, stopBg, metricsSrv)
 }
 
-// join starts memberlist and a store client whose waits stretch with each store's round trip.
-func join(c *commonOpts, meta cluster.Meta) (*memberlist.Memberlist, *shard.Client) {
+func newClient(secret string) (*shard.Client, *cluster.RTT) {
 	rtt := cluster.NewRTT()
+	client := shard.NewClient(cluster.APIToken(secret))
+	client.RTT = rtt.Of
+	return client, rtt
+}
+
+func join(ctx context.Context, c *commonOpts, meta cluster.Meta, rtt *cluster.RTT) *memberlist.Memberlist {
 	ml, err := cluster.New(c.ip, c.gossipPort, c.secret, meta, rtt)
 	if err != nil {
 		log.Fatal(err)
 	}
-	go cluster.Join(ml, c.peers)
-	client := shard.NewClient(cluster.APIToken(c.secret))
-	client.RTT = rtt.Of
-	return ml, client
+	cluster.JoinOnce(ml, c.peers, 5*time.Second)
+	go cluster.Join(ctx, ml, c.peers)
+	return ml
 }
 
 func connect(c *commonOpts) *db.Cassandra {
@@ -238,16 +332,11 @@ func connect(c *commonOpts) *db.Cassandra {
 	return d
 }
 
-func listen(c *commonOpts, port int, h http.Handler, ml *memberlist.Memberlist, stopBg context.CancelFunc) {
+func listen(c *commonOpts, ln net.Listener, h http.Handler, ml *memberlist.Memberlist, stopBg context.CancelFunc, metricsSrv *http.Server) {
 	srv := &http.Server{
-		Addr:              net.JoinHostPort(c.ip, strconv.Itoa(port)),
 		Handler:           h,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
-	}
-	ln, err := shard.Listen(srv.Addr)
-	if err != nil {
-		log.Fatal(err)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -255,35 +344,52 @@ func listen(c *commonOpts, port int, h http.Handler, ml *memberlist.Memberlist, 
 			log.Fatal(err)
 		}
 	}()
-	log.Printf("listening on %s, %d cluster members", srv.Addr, ml.NumMembers())
+	log.Printf("listening on %s, %d cluster members", ln.Addr(), ml.NumMembers())
+	if zerodown.IsChild() {
+		zerodown.StartupFinished()
+	}
 	<-ctx.Done()
 	stop() // a second signal kills right away
 	if stopBg != nil {
 		stopBg()
 	}
-	log.Printf("shutting down, waiting up to %v for requests in flight", drainWait)
-	cluster.Leave(ml, 5*time.Second) // peers stop sending here now instead of in ~30s
-	dctx, cancel := context.WithTimeout(context.Background(), drainWait)
+	if metricsSrv != nil {
+		mctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = metricsSrv.Shutdown(mctx)
+		cancel()
+	}
+	log.Printf("shutting down, waiting up to %v for requests in flight", c.drainWait)
+	cluster.Leave(ml, 5*time.Second)
+	_ = ml.Shutdown()
+	dctx, cancel := context.WithTimeout(context.Background(), c.drainWait)
 	defer cancel()
 	if err := srv.Shutdown(dctx); err != nil {
 		log.Printf("shutdown: %v", err)
 	}
 }
 
-// serveMetrics starts the -metricsPort listener, if set.
-func serveMetrics(c *commonOpts, write func(*metrics.Writer)) {
+func serveMetrics(c *commonOpts, write func(*metrics.Writer)) *http.Server {
 	if c.metricsPort == 0 {
-		return
+		return nil
 	}
-	ln, err := net.Listen("tcp", net.JoinHostPort(c.ip, strconv.Itoa(c.metricsPort)))
+	ln, err := inheritedListener("FILESCALE_METRICS_FD")
 	if err != nil {
 		log.Fatal(err)
 	}
+	if ln == nil {
+		ln, err = net.Listen("tcp", net.JoinHostPort(c.ip, strconv.Itoa(c.metricsPort)))
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", metrics.Handler(write))
-	go (&http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}).Serve(ln)
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	go func() {
+		if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("metrics: %v", err)
+		}
+	}()
 	log.Printf("metrics on %s/metrics", ln.Addr())
+	return srv
 }
-
-// drainWait is how long a shutdown waits for requests in flight, a var so tests can shrink it.
-var drainWait = 30 * time.Second

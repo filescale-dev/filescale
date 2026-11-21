@@ -1,13 +1,17 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -24,16 +28,12 @@ func TestMetricsPort(t *testing.T) {
 	if err := fs.Parse(nil); err != nil || c.metricsPort != 0 {
 		t.Fatalf("default -metricsPort %d, %v: want off", c.metricsPort, err)
 	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	ln.Close()
+	port := freePort(t)
 	if err := fs.Parse([]string{"-ip=127.0.0.1", fmt.Sprint("-metricsPort=", port)}); err != nil {
 		t.Fatal(err)
 	}
-	serveMetrics(c, func(m *metrics.Writer) { m.Counter("filescale_test_total", "Test.", 7) })
+	srv := serveMetrics(c, func(m *metrics.Writer) { m.Counter("filescale_test_total", "Test.", 7) })
+	t.Cleanup(func() { srv.Close() })
 	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/metrics", port))
 	if err != nil {
 		t.Fatal(err)
@@ -45,27 +45,32 @@ func TestMetricsPort(t *testing.T) {
 	}
 }
 
+func TestDrainWaitFlag(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	c := commonFlags(fs)
+	if err := fs.Parse(nil); err != nil || c.drainWait != 30*time.Second {
+		t.Fatalf("default -drainWait = %v, %v: want 30s", c.drainWait, err)
+	}
+	if err := fs.Parse([]string{"-drainWait=2m"}); err != nil || c.drainWait != 2*time.Minute {
+		t.Fatalf("custom -drainWait = %v, %v: want 2m", c.drainWait, err)
+	}
+}
+
 // SIGTERM lets a request in flight finish before listen returns; one that outlasts
 // drainWait is cut off.
 func TestListenDrains(t *testing.T) {
-	old := drainWait
-	t.Cleanup(func() { drainWait = old })
 	for i, finishes := range []bool{true, false} {
-		drainWait = 5 * time.Second
+		wait := 5 * time.Second
 		if !finishes {
-			drainWait = 300 * time.Millisecond
+			wait = 300 * time.Millisecond
 		}
 		ml, err := cluster.New("127.0.0.1", 17960+i, "", cluster.Meta{Role: "serve"}, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { ml.Shutdown() })
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		port := ln.Addr().(*net.TCPAddr).Port
-		ln.Close()
+		c := &commonOpts{ip: "127.0.0.1", drainWait: wait}
+		ln, port := apiListener(c, 0)
 
 		started, release := make(chan struct{}), make(chan struct{})
 		t.Cleanup(func() { close(release) })
@@ -76,7 +81,7 @@ func TestListenDrains(t *testing.T) {
 		})
 		returned := make(chan struct{})
 		go func() {
-			listen(&commonOpts{ip: "127.0.0.1"}, port, h, ml, nil)
+			listen(c, ln, h, ml, nil, nil)
 			close(returned)
 		}()
 		got := make(chan error, 1)
@@ -111,6 +116,231 @@ func TestListenDrains(t *testing.T) {
 			t.Fatal("listen didn't return after the last request")
 		}
 	}
+}
+
+func TestZerodownHelper(t *testing.T) {
+	if os.Getenv("FILESCALE_ZD_HELPER") == "" {
+		return
+	}
+	port, _ := strconv.Atoi(os.Getenv("FILESCALE_ZD_PORT"))
+	mport, _ := strconv.Atoi(os.Getenv("FILESCALE_ZD_METRICS"))
+	gport, _ := strconv.Atoi(os.Getenv("FILESCALE_ZD_GOSSIP"))
+	peer := os.Getenv("FILESCALE_ZD_PEER")
+	gate := os.Getenv("FILESCALE_ZD_GATE")
+	c := &commonOpts{
+		ip:          "127.0.0.1",
+		gossipPort:  gport,
+		peers:       []string{peer},
+		metricsPort: mport,
+		drainWait:   5 * time.Second,
+	}
+	if supervise(c, port) {
+		os.Exit(0)
+	}
+	ln, boundPort := apiListener(c, port)
+	bg, stopBg := context.WithCancel(context.Background())
+	ml := join(bg, c, cluster.Meta{Role: "store", Port: boundPort}, nil)
+	pid := strconv.Itoa(os.Getpid())
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Pid", pid)
+		if r.URL.Path == "/slow" {
+			_ = os.WriteFile(gate+".started", []byte(pid), 0o644)
+			for {
+				if _, err := os.Stat(gate + ".release"); err == nil {
+					break
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+		}
+		io.WriteString(w, pid)
+	})
+	msrv := serveMetrics(c, func(m *metrics.Writer) { m.Gauge("filescale_child_pid", "Child PID.", float64(os.Getpid())) })
+	listen(c, ln, h, ml, stopBg, msrv)
+	os.Exit(0)
+}
+
+func TestZerodownReloadAndDrain(t *testing.T) {
+	peerPort := freePort(t)
+	peer, err := cluster.New("127.0.0.1", peerPort, "", cluster.Meta{Role: "serve", Port: 8080}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { peer.Shutdown() })
+
+	apiPort := freePort(t)
+	metricsPort := freePort(t)
+	gossipPort := freePort(t)
+	gate := filepath.Join(t.TempDir(), "gate")
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestZerodownHelper$")
+	cmd.Env = append(os.Environ(),
+		"FILESCALE_ZD_HELPER=1",
+		fmt.Sprintf("FILESCALE_ZD_PORT=%d", apiPort),
+		fmt.Sprintf("FILESCALE_ZD_METRICS=%d", metricsPort),
+		fmt.Sprintf("FILESCALE_ZD_GOSSIP=%d", gossipPort),
+		fmt.Sprintf("FILESCALE_ZD_PEER=127.0.0.1:%d", peerPort),
+		"FILESCALE_ZD_GATE="+gate,
+	)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
+	t.Cleanup(func() {
+		select {
+		case <-exited:
+		default:
+			_ = cmd.Process.Kill()
+		}
+	})
+
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	fetch := func(path string) (string, error) {
+		resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d%s", apiPort, path))
+		if err != nil {
+			return "", err
+		}
+		defer resp.Body.Close()
+		b, err := io.ReadAll(resp.Body)
+		return string(b), err
+	}
+
+	var pid1 string
+	for start := time.Now(); ; time.Sleep(30 * time.Millisecond) {
+		if body, err := fetch("/fast"); err == nil {
+			pid1 = body
+			break
+		}
+		if time.Since(start) > 10*time.Second {
+			t.Fatal("child 1 never came up")
+		}
+	}
+	storeAddr := fmt.Sprintf("127.0.0.1:%d", apiPort)
+	if !cluster.AliveStoreAddrs(peer)[storeAddr] {
+		t.Fatalf("peer missing %s after startup", storeAddr)
+	}
+
+	slowDone := make(chan string, 1)
+	slowErr := make(chan error, 1)
+	go func() {
+		body, err := fetch("/slow")
+		if err != nil {
+			slowErr <- err
+			return
+		}
+		slowDone <- body
+	}()
+	for start := time.Now(); ; time.Sleep(20 * time.Millisecond) {
+		if _, err := os.Stat(gate + ".started"); err == nil {
+			break
+		}
+		if time.Since(start) > 5*time.Second {
+			t.Fatal("slow request never reached child 1")
+		}
+	}
+
+	if err := cmd.Process.Signal(syscall.SIGHUP); err != nil {
+		t.Fatal(err)
+	}
+
+	var pid2 string
+	for start := time.Now(); ; time.Sleep(30 * time.Millisecond) {
+		body, err := fetch("/fast")
+		if err != nil {
+			t.Fatalf("request failed during reload: %v", err)
+		}
+		if body != pid1 {
+			pid2 = body
+			break
+		}
+		if time.Since(start) > 10*time.Second {
+			t.Fatal("child 2 never took over after SIGHUP")
+		}
+	}
+
+	for start := time.Now(); ; time.Sleep(30 * time.Millisecond) {
+		mresp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/metrics", metricsPort))
+		if err != nil {
+			t.Fatalf("metrics failed during reload: %v", err)
+		}
+		mb, _ := io.ReadAll(mresp.Body)
+		mresp.Body.Close()
+		if strings.Contains(string(mb), "filescale_child_pid "+pid2+"\n") {
+			break
+		}
+		if time.Since(start) > 5*time.Second {
+			t.Fatalf("metrics never switched to child 2 (%s):\n%s", pid2, mb)
+		}
+	}
+	if !cluster.AliveStoreAddrs(peer)[storeAddr] {
+		t.Fatalf("peer lost %s during reload", storeAddr)
+	}
+
+	if err := os.WriteFile(gate+".release", nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-slowErr:
+		t.Fatalf("slow request failed during reload: %v", err)
+	case body := <-slowDone:
+		if body != pid1 {
+			t.Errorf("slow request served by %s, want %s", body, pid1)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("slow request never finished")
+	}
+
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-exited:
+		if err != nil {
+			t.Fatalf("parent exit after SIGTERM: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("parent never exited after SIGTERM")
+	}
+	for start := time.Now(); cluster.AliveStoreAddrs(peer)[storeAddr]; time.Sleep(20 * time.Millisecond) {
+		if time.Since(start) > 3*time.Second {
+			t.Fatal("peer still sees store alive after SIGTERM")
+		}
+	}
+}
+
+func TestCLIValidationBeforeSupervise(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "filescale")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+	for _, args := range [][]string{
+		{"serve", "-h"},
+		{"store", "-h"},
+		{"serve", "-drainWait", "-1s"},
+		{"serve", "-dataShards", "0"},
+		{"store", "-minFreeSpace", "101"},
+	} {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		out, err := exec.CommandContext(ctx, bin, args...).CombinedOutput()
+		cancel()
+		if ctx.Err() != nil {
+			t.Fatalf("%v hung (spawned supervisor?):\n%s", args, out)
+		}
+		if args[1] != "-h" && err == nil {
+			t.Errorf("%v: want non-zero exit", args)
+		}
+	}
+}
+
+func freePort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+	return port
 }
 
 // get fetches / from port, retrying until it listens, and wants "done".
