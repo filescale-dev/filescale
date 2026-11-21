@@ -15,7 +15,6 @@ import (
 	"syscall"
 	"time"
 
-	"fornaxian.tech/zerodown"
 	"github.com/hashicorp/memberlist"
 
 	"filescale/internal/cluster"
@@ -25,6 +24,7 @@ import (
 	"filescale/internal/serve"
 	"filescale/internal/shard"
 	"filescale/internal/store"
+	"filescale/internal/zerodown"
 )
 
 type commonOpts struct {
@@ -158,8 +158,8 @@ func main() {
 		if o.smallFileSize == 0 {
 			o.smallFileSize = o.dataShards * (512 << 10) / max(o.parityShards, 1)
 		}
-		if supervise(c, o.port) {
-			return
+		if code, parent := supervise(c, o.port); parent {
+			os.Exit(code)
 		}
 		runServe(c, o)
 	case "store":
@@ -172,8 +172,8 @@ func main() {
 		if o.minFreeSpace < 0 || o.minFreeSpace > 100 {
 			log.Fatalf("-minFreeSpace %d: want 0-100", o.minFreeSpace)
 		}
-		if supervise(c, o.port) {
-			return
+		if code, parent := supervise(c, o.port); parent {
+			os.Exit(code)
 		}
 		runStore(c, o)
 	default:
@@ -181,32 +181,31 @@ func main() {
 	}
 }
 
-func supervise(c *commonOpts, port int) bool {
-	if zerodown.IsParent() {
-		api, err := openFile(shard.Listen(net.JoinHostPort(c.ip, strconv.Itoa(port))))
+func supervise(c *commonOpts, port int) (int, bool) {
+	if zerodown.IsChild() {
+		return 0, false
+	}
+	api, err := openFile(shard.Listen(net.JoinHostPort(c.ip, strconv.Itoa(port))))
+	if err != nil {
+		log.Fatal(err)
+	}
+	files := []*os.File{api}
+	vars := []string{"FILESCALE_API_FD=3", "FILESCALE_METRICS_FD="}
+	if c.metricsPort != 0 {
+		m, err := openFile(net.Listen("tcp", net.JoinHostPort(c.ip, strconv.Itoa(c.metricsPort))))
 		if err != nil {
+			api.Close()
 			log.Fatal(err)
 		}
-		files := []*os.File{api}
-		vars := []string{"FILESCALE_API_FD=3", "FILESCALE_METRICS_FD="}
-		if c.metricsPort != 0 {
-			m, err := openFile(net.Listen("tcp", net.JoinHostPort(c.ip, strconv.Itoa(c.metricsPort))))
-			if err != nil {
-				api.Close()
-				log.Fatal(err)
-			}
-			files = append(files, m)
-			vars[1] = "FILESCALE_METRICS_FD=4"
-		}
-		zerodown.ExtraFiles = files
-		zerodown.ExtraVariables = vars
-		defer func() {
-			for _, f := range files {
-				f.Close()
-			}
-		}()
+		files = append(files, m)
+		vars[1] = "FILESCALE_METRICS_FD=4"
 	}
-	return zerodown.Init()
+	defer func() {
+		for _, f := range files {
+			f.Close()
+		}
+	}()
+	return zerodown.Run(zerodown.Options{ExtraFiles: files, ExtraEnv: vars}), true
 }
 
 func openFile(ln net.Listener, err error) (*os.File, error) {
@@ -346,7 +345,7 @@ func listen(c *commonOpts, ln net.Listener, h http.Handler, ml *memberlist.Membe
 	}()
 	log.Printf("listening on %s, %d cluster members", ln.Addr(), ml.NumMembers())
 	if zerodown.IsChild() {
-		zerodown.StartupFinished()
+		zerodown.Ready()
 	}
 	<-ctx.Done()
 	stop() // a second signal kills right away

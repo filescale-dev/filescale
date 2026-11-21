@@ -3,7 +3,6 @@ module filescale
 go 1.25.0
 
 require (
-	fornaxian.tech/zerodown v0.0.0-20230523212539-9235749ce137
 	github.com/apache/cassandra-gocql-driver/v2 v2.1.2
 	github.com/hashicorp/go-sockaddr v1.0.7
 	github.com/hashicorp/memberlist v0.7.0

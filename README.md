@@ -39,7 +39,7 @@ This project was written with heavy AI use, and validated by a human.
 - Pixeldrain's [pixelstore](https://www.patreon.com/pixeldrain/posts/erasure-coding-72493411) (Not associated with this project) - design choices and implementation
 - [klauspost/reedsolomon](https://github.com/klauspost/reedsolomon) - underlying library used for erasure coding
 - [hashicorp/memberlist](https://github.com/hashicorp/memberlist) - peer discovery
-- [Fornaxian/zerodown](https://github.com/Fornaxian/zerodown) - zero-downtime rolling restarts
+- [Fornaxian/zerodown](https://github.com/Fornaxian/zerodown) - inspiration for zero-downtime rolling restarts
 
 ## Requirements
 - Linux, Go 1.25+ to build
@@ -270,10 +270,10 @@ Files up to 64 MiB are one part and just get sent again. Unfinished uploads expi
   - Use `read_ahead_kb` set to 1-4 MiB on HDDs (the default is 128 KiB)
   - Keep `vm.dirty_bytes` low enough that unflushed data stays under a minute old under sustained writes
   - Use `mq-deadline` (the usual HDD default) as it keeps writeback from starving reads; try `bfq` if read latency still suffers while uploads run.
-- **Upgrades (rolling restarts).** Upgrade stores first, then serves. filescale uses [`zerodown`](https://github.com/Fornaxian/zerodown), see the below on how to upgrade without traffic loss.
+- **Upgrades (rolling restarts).** Upgrade stores first, then serves.
   - Atomically replace the binary (`install -m 755 filescale.new /usr/local/bin/filescale` or `mv`; never `cp` over a running binary) and send `SIGHUP` to the parent (`kill -HUP <pid>` or `systemctl reload`).
   - Changing flags requires a full restart.
-  - Under systemd, use `KillMode=control-group`, `KillSignal=SIGINT`, and `ExecReload=/bin/kill -HUP $MAINPID`.
+  - Under systemd, use `Restart=on-failure`, `KillMode=control-group`, `KillSignal=SIGINT`, and `ExecReload=/bin/kill -HUP $MAINPID` (the parent exits non-zero if the live child crashes so systemd restarts it).
 - **Shutdown.** `SIGTERM` or `SIGINT` (Ctrl-C) leaves the memberlist at once, so peers stop sending to this node immediately.
   - filescale lets requests in flight finish for up to `-drainWait` (default 30s).
   - A second signal to the child exits at once.
@@ -383,3 +383,4 @@ e.g. `systemd-run --scope -p MemoryMax=8G ...`.
 | `internal/cluster` | memberlist, node metadata, round-trip tracking |
 | `internal/b3` | saving BLAKE3 state for resumed uploads |
 | `internal/metrics` | Prometheus text format |
+| `internal/zerodown` | parent supervisor for `SIGHUP` rolling restarts |

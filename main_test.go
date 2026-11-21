@@ -134,8 +134,8 @@ func TestZerodownHelper(t *testing.T) {
 		metricsPort: mport,
 		drainWait:   5 * time.Second,
 	}
-	if supervise(c, port) {
-		os.Exit(0)
+	if code, parent := supervise(c, port); parent {
+		os.Exit(code)
 	}
 	ln, boundPort := apiListener(c, port)
 	bg, stopBg := context.WithCancel(context.Background())
@@ -322,8 +322,9 @@ func TestCLIValidationBeforeSupervise(t *testing.T) {
 	} {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		out, err := exec.CommandContext(ctx, bin, args...).CombinedOutput()
+		hung := ctx.Err() != nil
 		cancel()
-		if ctx.Err() != nil {
+		if hung {
 			t.Fatalf("%v hung (spawned supervisor?):\n%s", args, out)
 		}
 		if args[1] != "-h" && err == nil {
