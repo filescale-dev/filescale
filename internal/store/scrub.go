@@ -38,6 +38,9 @@ func (s *Store) cleanDisk(ctx context.Context, d *disk, pass time.Duration) erro
 	start, step := time.Now(), pass/db.Buckets
 	err := d.walk(func(bucket int, dir string, names []string) error {
 		sleep(ctx, time.Until(start.Add(step*time.Duration(bucket))))
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		rows, err := s.DB.Shards(ctx, d.id, bucket)
 		if err != nil { // skip it, the next pass retries
 			log.Printf("cleanup %s bucket %d: %v", d.dir, bucket, err)
@@ -130,6 +133,8 @@ type pace struct {
 
 // scrubDisk scrubs one disk's buckets from p.next on, see pace.
 func (s *Store) scrubDisk(ctx context.Context, d *disk, p pace, since time.Time) error {
+	var failed int
+	var first error
 	for b := p.next; b < db.Buckets; b++ {
 		if p.pass > 0 {
 			if wait := time.Until(p.start.Add(p.pass / db.Buckets * time.Duration(b))); wait > 0 {
@@ -140,8 +145,12 @@ func (s *Store) scrubDisk(ctx context.Context, d *disk, p pace, since time.Time)
 			return err
 		}
 		rows, err := s.DB.Shards(ctx, d.id, b)
-		if err != nil { // skip it, the next pass retries
+		if err != nil {
 			log.Printf("scrub %s bucket %d: %v", d.dir, b, err)
+			failed++
+			if first == nil {
+				first = err
+			}
 		}
 		for _, row := range rows {
 			if row.Written.Before(since) {
@@ -157,6 +166,9 @@ func (s *Store) scrubDisk(ctx context.Context, d *disk, p pace, since time.Time)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if failed > 0 {
+		return fmt.Errorf("failed buckets: %d, first: %w", failed, first)
 	}
 	if since.IsZero() { // a whole pass, not a crash check
 		d.scrubbed.Store(time.Now().UnixNano())
@@ -226,13 +238,16 @@ func (s *Store) scrubLoop(ctx context.Context, d *disk) {
 			saveScrub(d, st)
 		}}
 		if err := s.scrubDisk(ctx, d, p, time.Time{}); err != nil {
-			if ctx.Err() == nil {
-				log.Printf("scrub %s: %v", d.dir, err)
+			if ctx.Err() != nil {
+				return
 			}
-			return
+			log.Printf("scrub %s: %v", d.dir, err)
 		}
 		now := time.Now()
-		st = scrubState{start: now.Add(scrubGap), last: now}
+		st = scrubState{start: now.Add(scrubGap), last: st.last}
+		if last := d.scrubbed.Load(); last > 0 {
+			st.last = time.Unix(0, last)
+		}
 		saveScrub(d, st)
 	}
 }
@@ -243,13 +258,12 @@ func (s *Store) scrubShard(ctx context.Context, d *disk, row db.Shard) (int64, e
 		return 0, err
 	}
 	k := row.Index
-	// orphan: lost an overwrite race, a delete crashed, or repair moved the shard elsewhere
 	orphan := func(f *db.File) bool {
 		i := -1
 		if f != nil {
 			i = f.PartOf(row.FileID)
 		}
-		return i < 0 || k >= f.DataShards+f.ParityShards || f.Part(i).Stores[k] != d.id
+		return i < 0 || k < 0 || k >= f.DataShards+f.ParityShards || f.Part(i).Stores[k] != d.id
 	}
 	if orphan(f) {
 		if time.Since(row.Written) <= young {
@@ -270,25 +284,29 @@ func (s *Store) scrubShard(ctx context.Context, d *disk, row db.Shard) (int64, e
 	}
 	f = f.Part(f.PartOf(row.FileID))
 	path := d.path(row.FileID, k)
+	l := erasure.Layout{Size: f.Size, Data: f.DataShards}
+	hdr := int64(len(shard.Magic))
 	file, err := os.OpenFile(path, os.O_RDWR, 0)
 	if errors.Is(err, fs.ErrNotExist) {
 		log.Printf("scrub: %s is missing, rebuilding it", path)
 		d.missing.Add(1)
-		file, err = create(path) // empty, so every block reads as bad
+		if err := s.rebuildMissing(ctx, path, f, k, l); err != nil {
+			return 0, err
+		}
+		d.blocks.Add(l.Stripes())
+		return 0, nil
 	}
 	if err != nil {
 		return 0, err
 	}
 	defer file.Close()
 	sequential(file)
-	hdr := int64(len(shard.Magic))
 	magic := make([]byte, hdr)
 	if _, err := file.ReadAt(magic, 0); err != nil || string(magic) != shard.Magic {
 		if _, err := file.WriteAt([]byte(shard.Magic), 0); err != nil {
 			return 0, err
 		}
 	}
-	l := erasure.Layout{Size: f.Size, Data: f.DataShards}
 	buf := make([]byte, erasure.BlockSize+4)
 	var bad []int64
 	var read int64
@@ -301,6 +319,7 @@ func (s *Store) scrubShard(ctx context.Context, d *disk, row db.Shard) (int64, e
 		}
 	}
 	if len(bad) == 0 {
+		dontNeed(file)
 		return read, nil
 	}
 	if err := s.rebuild(ctx, file, f, k, bad); err != nil {
@@ -308,6 +327,40 @@ func (s *Store) scrubShard(ctx context.Context, d *disk, row db.Shard) (int64, e
 	}
 	d.blocks.Add(int64(len(bad)))
 	return read, nil
+}
+
+func (s *Store) rebuildMissing(ctx context.Context, path string, f *db.File, k int, l erasure.Layout) error {
+	file, err := createTemp(path)
+	if err != nil {
+		return err
+	}
+	tmp := file.Name()
+	ok := false
+	defer func() {
+		file.Close()
+		if !ok {
+			os.Remove(tmp)
+		}
+	}()
+	preallocate(file, int64(len(shard.Magic))+l.ShardSize())
+	if _, err := file.WriteString(shard.Magic); err != nil {
+		return err
+	}
+	bad := make([]int64, l.Stripes())
+	for i := range bad {
+		bad[i] = int64(i)
+	}
+	if err := s.rebuild(ctx, file, f, k, bad); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	ok = true
+	return nil
 }
 
 // rebuild rewrites bad blocks of shard k in place from the file's other shards,

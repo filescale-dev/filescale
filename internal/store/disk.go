@@ -30,3 +30,5 @@ func preallocate(f *os.File, n int64) { unix.Fallocate(int(f.Fd()), unix.FALLOC_
 
 // sequential tells the kernel a shard is read front to back: twice the readahead.
 func sequential(f *os.File) { unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_SEQUENTIAL) }
+
+func dontNeed(f *os.File) { unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_DONTNEED) }

@@ -119,6 +119,17 @@ func TestPutRejects(t *testing.T) {
 		t.Errorf("cut-off body: %s", resp.Status)
 	}
 	waitFor(t, "cut-off shard removed", func() bool { return !exists(path) })
+
+	// A failed overwrite must leave an existing live shard intact.
+	if code, b := do(t, "PUT", u, stream); code != http.StatusCreated {
+		t.Fatalf("PUT good: %d %s", code, b)
+	}
+	if code, _ := do(t, "PUT", u, bad); code != http.StatusBadRequest {
+		t.Fatalf("bad overwrite: %d", code)
+	}
+	if code, b := do(t, "GET", u, nil); code != http.StatusOK || !bytes.Equal(b, stream) {
+		t.Errorf("live shard damaged after failed overwrite: %d, %d bytes", code, len(b))
+	}
 }
 
 // A serve that stops sending mid-shard is dropped at the stall timer, its partial shard removed.
@@ -571,6 +582,21 @@ func TestScrubOrphanRows(t *testing.T) {
 	}
 	if !hasRow(m, d.id, live) {
 		t.Error("the valid row dropped")
+	}
+}
+
+func TestScrubFailedMissingLeavesNoFile(t *testing.T) {
+	s, _, m := newStore(t, 5)
+	d := s.list[0]
+	ctx := context.Background()
+	fid := newID(t)
+	m.PutFile(ctx, &db.File{Name: "m", ID: fid, Size: 100, DataShards: 1, Stores: []db.UUID{d.id}})
+	m.PutShard(ctx, db.Shard{StoreID: d.id, FileID: fid, Index: 0, Name: "m"})
+	if err := s.Scrub(ctx, false, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	if exists(d.path(fid, 0)) {
+		t.Error("failed rebuild of missing shard left a file behind")
 	}
 }
 

@@ -188,7 +188,6 @@ func (s *Store) put(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body.Read(nil) // checks passed: 100 Continue now, creating the file can be slow
 	if err := writeShard(path, r.Body, size, http.NewResponseController(w)); err != nil {
-		os.Remove(path)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -199,11 +198,18 @@ func writeShard(path string, body io.Reader, size int64, rc *http.ResponseContro
 	if size < 4 {
 		return errors.New("shard too short")
 	}
-	f, err := create(path)
+	f, err := createTemp(path)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	tmp := f.Name()
+	ok := false
+	defer func() {
+		f.Close()
+		if !ok {
+			os.Remove(tmp)
+		}
+	}()
 	preallocate(f, int64(len(shard.Magic))+size)
 	if _, err := f.WriteString(shard.Magic); err != nil {
 		return err
@@ -216,7 +222,7 @@ func writeShard(path string, body io.Reader, size int64, rc *http.ResponseContro
 		if _, err := io.ReadFull(body, buf[:n]); err != nil {
 			return err
 		}
-		if _, ok := shard.Check(buf[:n]); !ok {
+		if _, good := shard.Check(buf[:n]); !good {
 			return errors.New("bad CRC")
 		}
 		if _, err := f.Write(buf[:n]); err != nil {
@@ -224,10 +230,28 @@ func writeShard(path string, body io.Reader, size int64, rc *http.ResponseContro
 		}
 		left -= n
 	}
-	return f.Close()
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	ok = true
+	return nil
 }
 
-// create makes a shard file, creating its prefix dirs the first time they're used.
+func createTemp(path string) (*os.File, error) {
+	dir, base := filepath.Dir(path), filepath.Base(path)+".tmp-*"
+	f, err := os.CreateTemp(dir, base)
+	if !errors.Is(err, fs.ErrNotExist) {
+		return f, err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	return os.CreateTemp(dir, base)
+}
+
 func create(path string) (*os.File, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0o644)
 	if !errors.Is(err, fs.ErrNotExist) {
