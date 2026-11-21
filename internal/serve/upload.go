@@ -170,6 +170,9 @@ func (s *Serve) upload(w http.ResponseWriter, r *http.Request, name string, uplo
 				near = func() { next = open(i+1, stores) }
 			}
 			err = j.stream(layout(i), o.puts, s.Client.Wait(acceptWait, o.puts[0].store.Addr), near)
+			if err != nil {
+				cancelPuts(o.puts)
+			}
 		}
 		if ferr := <-finished; err == nil { // the part before still lands and is recorded if this one fails
 			err = ferr
@@ -369,7 +372,7 @@ func (j *job) stream(l erasure.Layout, puts []*put, lead time.Duration, near fun
 				return err
 			}
 		}
-		if err := writeAll(j.ctx, j.cancel, puts, j.blocks); err != nil {
+		if err := writeAll(j.ctx, puts, j.blocks); err != nil {
 			return err
 		}
 		// time left at the rate so far, not bytes: a slow client would leave the next PUTs idle past the store's stall
@@ -381,60 +384,140 @@ func (j *job) stream(l erasure.Layout, puts []*put, lead time.Duration, near fun
 	return nil
 }
 
-// put is one shard streaming to a store.
 type put struct {
 	store  db.Store
-	pw     *io.PipeWriter
 	cancel context.CancelFunc
 	done   chan error
-	crc    [4]byte
+
+	send     chan []byte
+	ack      chan struct{}
+	closed   chan struct{}
+	failOnce sync.Once
+	endOnce  sync.Once
+	err      error
+
+	cur []byte
+	crc [4]byte
+	rem []byte
 }
 
-func (p *put) write(b []byte) error {
-	_, err := p.pw.Write(b)
-	if err == nil {
-		_, err = p.pw.Write(binary.LittleEndian.AppendUint32(p.crc[:0], shard.CRC(b)))
-	}
-	if err != nil { // a dead store only shows up as a closed pipe here
-		err = fmt.Errorf("store %s: %w", p.store.Addr, err)
-	}
-	return err
+func (p *put) fail(err error) {
+	p.failOnce.Do(func() {
+		p.err = err
+		close(p.closed)
+	})
 }
 
-// writeAll sends every shard its block at once, a stalled store cancels the whole upload.
-func writeAll(ctx context.Context, cancel context.CancelCauseFunc, puts []*put, blocks [][]byte) error {
-	errs := make(chan error, len(puts))
+func (p *put) closeBody() {
+	p.endOnce.Do(func() {
+		close(p.send)
+	})
+}
+
+func (p *put) Close() error { return nil }
+
+func (p *put) Read(dst []byte) (int, error) {
+	if len(p.cur) == 0 && len(p.rem) == 0 {
+		select {
+		case <-p.closed:
+			return 0, p.err
+		default:
+		}
+		select {
+		case <-p.closed:
+			return 0, p.err
+		case b, ok := <-p.send:
+			if !ok {
+				return 0, io.EOF
+			}
+			binary.LittleEndian.PutUint32(p.crc[:], shard.CRC(b))
+			p.cur = b
+			p.rem = p.crc[:]
+		}
+	}
+	n := copy(dst, p.cur)
+	p.cur = p.cur[n:]
+	if len(p.cur) == 0 && len(p.rem) > 0 && n < len(dst) {
+		m := copy(dst[n:], p.rem)
+		p.rem = p.rem[m:]
+		n += m
+	}
+	if len(p.cur) == 0 && len(p.rem) == 0 {
+		p.ack <- struct{}{}
+	}
+	return n, nil
+}
+
+func cancelPuts(puts []*put) {
+	for _, p := range puts {
+		if p != nil {
+			p.cancel()
+		}
+	}
+}
+
+// writeAll sends every shard its block at once, a stalled store cancels the part's PUTs.
+func writeAll(ctx context.Context, puts []*put, blocks [][]byte) error {
 	for i, p := range puts {
-		go func() {
-			t := time.AfterFunc(shard.Stall, func() {
-				cancel(fmt.Errorf("store %s accepted no data for %v", p.store.Addr, shard.Stall))
-			})
-			defer t.Stop()
-			errs <- p.write(blocks[i])
-		}()
-	}
-	var first error
-	for range puts {
-		if err := <-errs; err != nil && first == nil {
-			first = err
+		select {
+		case <-p.closed:
+			return midStreamErr(ctx, puts, p)
+		default:
+		}
+		select {
+		case p.send <- blocks[i]:
+		case <-p.closed:
+			return midStreamErr(ctx, puts, p)
+		case <-ctx.Done():
+			cancelPuts(puts)
+			return &statusError{http.StatusServiceUnavailable, "store failed mid-stream: " + context.Cause(ctx).Error()}
 		}
 	}
-	if first != nil {
-		if err := context.Cause(ctx); err != nil { // which store stalled, the others only see the cancel
-			first = err
+	t := time.NewTimer(shard.Stall)
+	defer t.Stop()
+	for _, p := range puts {
+		select {
+		case <-p.ack:
+			continue
+		default:
 		}
-		return &statusError{http.StatusServiceUnavailable, "store failed mid-stream: " + first.Error()}
+		select {
+		case <-p.ack:
+		case <-p.closed:
+			select {
+			case <-p.ack:
+				continue
+			default:
+			}
+			return midStreamErr(ctx, puts, p)
+		case <-ctx.Done():
+			cancelPuts(puts)
+			return &statusError{http.StatusServiceUnavailable, "store failed mid-stream: " + context.Cause(ctx).Error()}
+		case <-t.C:
+			cancelPuts(puts)
+			return &statusError{http.StatusServiceUnavailable,
+				fmt.Sprintf("store failed mid-stream: store %s accepted no data for %v", p.store.Addr, shard.Stall)}
+		}
 	}
 	return nil
+}
+
+func midStreamErr(ctx context.Context, puts []*put, failed *put) error {
+	if cause := context.Cause(ctx); cause != nil {
+		cancelPuts(puts)
+		return &statusError{http.StatusServiceUnavailable, "store failed mid-stream: " + cause.Error()}
+	}
+	cancelPuts(puts)
+	return &statusError{http.StatusServiceUnavailable, "store failed mid-stream: " + failed.err.Error()}
 }
 
 // finish ends every shard's body and waits for the stores' 201.
 func finish(puts []*put) error {
 	for _, p := range puts {
-		p.pw.Close()
-		t := time.AfterFunc(commitWait, p.cancel)
-		defer t.Stop()
+		p.closeBody()
 	}
+	t := time.AfterFunc(commitWait, func() { cancelPuts(puts) })
+	defer t.Stop()
 	var first error
 	for _, p := range puts {
 		if err := <-p.done; err != nil && first == nil {
@@ -502,11 +585,7 @@ func (s *Serve) open(ctx context.Context, id db.UUID, size int64, shards []int, 
 		pending--
 	}
 	if failed != nil {
-		for _, p := range puts {
-			if p != nil {
-				p.cancel()
-			}
-		}
+		cancelPuts(puts)
 		return nil, failed
 	}
 	return puts, nil
@@ -514,7 +593,6 @@ func (s *Serve) open(ctx context.Context, id db.UUID, size int64, shards []int, 
 
 // start sends the PUT headers and returns once the store answers 100 Continue.
 func (s *Serve) start(ctx context.Context, st db.Store, id db.UUID, k int, size int64, repair bool) (*put, error) {
-	pr, pw := io.Pipe()
 	sent, accepted := make(chan struct{}), make(chan struct{})
 	var sentOnce, acceptedOnce sync.Once
 	trace := &httptrace.ClientTrace{
@@ -522,20 +600,27 @@ func (s *Serve) start(ctx context.Context, st db.Store, id db.UUID, k int, size 
 		Got100Continue:  func() { acceptedOnce.Do(func() { close(accepted) }) },
 	}
 	rctx, cancel := context.WithCancel(httptrace.WithClientTrace(ctx, trace))
-	// Transport won't return from Do until it stops reading the body, so a cancelled PUT must close the pipe
-	context.AfterFunc(rctx, func() { pr.CloseWithError(context.Canceled) })
+	p := &put{
+		store:  st,
+		cancel: cancel,
+		done:   make(chan error, 1),
+		send:   make(chan []byte, 1),
+		ack:    make(chan struct{}, 1),
+		closed: make(chan struct{}),
+	}
+	// Transport won't return from Do until it stops reading the body, so a cancelled PUT must wake Read
+	context.AfterFunc(rctx, func() { p.fail(context.Canceled) })
 	url := shard.URL(st.Addr, st.ID, id, k)
 	if repair {
 		url += "?repair=1"
 	}
-	req, err := http.NewRequestWithContext(rctx, http.MethodPut, url, pr)
+	req, err := http.NewRequestWithContext(rctx, http.MethodPut, url, p)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
 	req.ContentLength = size
 	req.Header.Set("Expect", "100-continue")
-	p := &put{store: st, pw: pw, cancel: cancel, done: make(chan error, 1)}
 	go func() {
 		resp, err := s.Client.Do(req)
 		if err == nil {
@@ -545,18 +630,25 @@ func (s *Serve) start(ctx context.Context, st db.Store, id db.UUID, k int, size 
 			}
 			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
+		} else {
+			err = fmt.Errorf("store %s: %w", st.Addr, err)
 		}
-		pr.CloseWithError(err) // wakes a write still waiting on this store
+		if err != nil {
+			p.fail(err)
+		} else {
+			p.fail(fmt.Errorf("store %s: answered before reading the shard", st.Addr))
+		}
 		p.done <- err
 	}()
-	// The store's clock starts once our headers are out, so only the wait after that
-	// counts here. Connecting has its own timeout in the dialer.
+	// Reset the timer once headers flush; before that, cap against a hung idle conn.
 	wait := s.Client.Wait(acceptWait, st.Addr)
-	var timeout <-chan time.Time
+	timer := time.NewTimer(2 * wait)
+	defer timer.Stop()
 	for {
 		select {
 		case <-sent:
-			sent, timeout = nil, time.After(wait)
+			sent = nil
+			timer.Reset(wait)
 		case <-accepted:
 			return p, nil
 		case err := <-p.done:
@@ -565,7 +657,7 @@ func (s *Serve) start(ctx context.Context, st db.Store, id db.UUID, k int, size 
 				err = errors.New("store answered before reading the shard")
 			}
 			return nil, err
-		case <-timeout:
+		case <-timer.C:
 			cancel()
 			return nil, fmt.Errorf("store %s: no 100 Continue within %v", st.Addr, wait)
 		}

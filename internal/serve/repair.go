@@ -160,10 +160,11 @@ func (s *Serve) repairFile(ctx context.Context, rows []db.Shard) error {
 	for st := range l.Stripes() {
 		for i, k := range idx {
 			if blocks[i], err = rd.Block(st, k); err != nil {
+				cancelPuts(puts)
 				return err
 			}
 		}
-		if err := writeAll(ctx, cancel, puts, blocks); err != nil {
+		if err := writeAll(ctx, puts, blocks); err != nil {
 			return err
 		}
 	}
