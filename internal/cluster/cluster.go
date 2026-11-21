@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/memberlist"
@@ -55,9 +56,15 @@ func New(ip string, port int, secret string, meta Meta, rtt *RTT) (*memberlist.M
 		return nil, err
 	}
 	cfg.Delegate = delegate(b)
-	cfg.Events = events(meta)
+	ev := newEvents(meta)
+	cfg.Events = ev
 	cfg.LogOutput = quiet{}
-	return memberlist.Create(cfg)
+	ml, err := memberlist.Create(cfg)
+	if err != nil {
+		return nil, err
+	}
+	ev.attach(ml)
+	return ml, nil
 }
 
 // Join joins peers every 5s while alone, then every minute: memberlist stops contacting
@@ -106,6 +113,32 @@ func Addrs(ml *memberlist.Memberlist, role string) []string {
 	return out
 }
 
+func AliveStoreAddrs(ml *memberlist.Memberlist) map[string]bool {
+	cacheMu.RLock()
+	ev := caches[ml]
+	cacheMu.RUnlock()
+	if ev != nil {
+		return *ev.stores.Load()
+	}
+	out := map[string]bool{}
+	for _, a := range Addrs(ml, "store") {
+		out[a] = true
+	}
+	return out
+}
+
+func Leave(ml *memberlist.Memberlist, timeout time.Duration) error {
+	cacheMu.Lock()
+	delete(caches, ml)
+	cacheMu.Unlock()
+	return ml.Leave(timeout)
+}
+
+var (
+	cacheMu sync.RWMutex
+	caches  = map[*memberlist.Memberlist]*events{}
+)
+
 // RTT is a smoothed round trip per host (TCP's 7/8 + 1/8), from memberlist's probes, so no extra traffic.
 type RTT struct {
 	mu sync.Mutex
@@ -145,21 +178,67 @@ func (delegate) GetBroadcasts(overhead, limit int) [][]byte { return nil }
 func (delegate) LocalState(join bool) []byte                { return nil }
 func (delegate) MergeRemoteState(buf []byte, join bool)     {}
 
-type events Meta
+type events struct {
+	meta   Meta
+	mu     sync.Mutex
+	byName map[string]string // store node name → HTTP addr
+	stores atomic.Pointer[map[string]bool]
+}
 
-func (e events) NotifyJoin(n *memberlist.Node) {
+func newEvents(meta Meta) *events {
+	e := &events{meta: meta, byName: map[string]string{}}
+	empty := map[string]bool{}
+	e.stores.Store(&empty)
+	return e
+}
+
+func (e *events) attach(ml *memberlist.Memberlist) {
+	cacheMu.Lock()
+	caches[ml] = e
+	cacheMu.Unlock()
+}
+
+func (e *events) publish() {
+	m := make(map[string]bool, len(e.byName))
+	for _, addr := range e.byName {
+		m[addr] = true
+	}
+	e.stores.Store(&m)
+}
+
+func (e *events) track(n *memberlist.Node, alive bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	var m Meta
-	if e.Role != "serve" || json.Unmarshal(n.Meta, &m) != nil || m.Role != "serve" {
+	if alive && json.Unmarshal(n.Meta, &m) == nil && m.Role == "store" {
+		addr := net.JoinHostPort(n.Addr.String(), strconv.Itoa(m.Port))
+		if e.byName[n.Name] == addr {
+			return
+		}
+		e.byName[n.Name] = addr
+		e.publish()
 		return
 	}
-	if m.DataShards != e.DataShards || m.ParityShards != e.ParityShards || m.SmallFileSize != e.SmallFileSize {
-		log.Printf("serve %s uses %d+%d, small files under %d, this one %d+%d, under %d",
-			n.Name, m.DataShards, m.ParityShards, m.SmallFileSize, e.DataShards, e.ParityShards, e.SmallFileSize)
+	if _, ok := e.byName[n.Name]; ok {
+		delete(e.byName, n.Name)
+		e.publish()
 	}
 }
 
-func (events) NotifyLeave(*memberlist.Node)  {}
-func (events) NotifyUpdate(*memberlist.Node) {}
+func (e *events) NotifyJoin(n *memberlist.Node) {
+	e.track(n, true)
+	var m Meta
+	if e.meta.Role != "serve" || json.Unmarshal(n.Meta, &m) != nil || m.Role != "serve" {
+		return
+	}
+	if m.DataShards != e.meta.DataShards || m.ParityShards != e.meta.ParityShards || m.SmallFileSize != e.meta.SmallFileSize {
+		log.Printf("serve %s uses %d+%d, small files under %d, this one %d+%d, under %d",
+			n.Name, m.DataShards, m.ParityShards, m.SmallFileSize, e.meta.DataShards, e.meta.ParityShards, e.meta.SmallFileSize)
+	}
+}
+
+func (e *events) NotifyLeave(n *memberlist.Node)  { e.track(n, false) }
+func (e *events) NotifyUpdate(n *memberlist.Node) { e.track(n, true) }
 
 // quiet drops memberlist's debug lines.
 type quiet struct{}

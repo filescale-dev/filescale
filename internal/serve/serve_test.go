@@ -929,7 +929,7 @@ func TestPickCap(t *testing.T) {
 		alive[st.Addr] = true
 	}
 	s := New(Config{Alive: func() map[string]bool { return alive }})
-	s.stores.Store(&stores)
+	s.stores.Store(&storeView{list: stores})
 	hits := 0
 	for range 2000 {
 		picked, err := s.pick(12, 1, nil, nil)
@@ -950,7 +950,7 @@ func TestPickCap(t *testing.T) {
 	for i := range huge {
 		huge[i] = db.Store{Addr: fmt.Sprint(i), Free: 1 << 60, LastSeen: time.Now()}
 	}
-	s.stores.Store(&huge)
+	s.stores.Store(&storeView{list: huge})
 	if picked, err := s.pick(12, 1, nil, nil); err != nil || len(picked) != 12 {
 		t.Errorf("huge Free pick: %d, %v", len(picked), err)
 	}

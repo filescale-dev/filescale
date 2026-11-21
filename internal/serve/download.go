@@ -88,8 +88,9 @@ type download struct {
 	l       erasure.Layout   // the part's
 	r       *shard.Reader    // the part's
 	next    *shard.Reader    // part+1, opened ahead
-	slow    map[db.UUID]bool // stores dropped for being slow, no part waits on them again
-	rebuilt int
+	slow        map[db.UUID]bool // stores dropped for being slow, no part waits on them again
+	rebuilt     int
+	deadlineAt  time.Time
 }
 
 func (d *download) Seek(off int64, whence int) (int64, error) {
@@ -130,7 +131,10 @@ func (d *download) Read(p []byte) (int, error) {
 	bs := int64(d.l.BlockLen(s))
 	off := pos - s*ss
 	k := int(off / bs)
-	d.rc.SetWriteDeadline(time.Now().Add(clientStall))
+	if now := time.Now(); now.Sub(d.deadlineAt) >= time.Second {
+		d.rc.SetWriteDeadline(now.Add(clientStall))
+		d.deadlineAt = now
+	}
 	b, err := d.r.Block(s, k)
 	if err != nil {
 		log.Printf("download %s: part %d stripe %d: %v", d.f.Name, d.part, s, err)

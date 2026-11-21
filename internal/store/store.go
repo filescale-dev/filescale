@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -21,6 +22,8 @@ import (
 	"filescale/internal/metrics"
 	"filescale/internal/shard"
 )
+
+var blockPool = sync.Pool{New: func() any { return make([]byte, erasure.BlockSize+4) }}
 
 type Config struct {
 	Dirs    []string
@@ -214,11 +217,20 @@ func writeShard(path string, body io.Reader, size int64, rc *http.ResponseContro
 	if _, err := f.WriteString(shard.Magic); err != nil {
 		return err
 	}
-	buf := make([]byte, min(size, erasure.BlockSize+4)) // a small file's shard is one short block
+	var buf []byte
+	if size >= erasure.BlockSize+4 {
+		buf = blockPool.Get().([]byte)
+		defer blockPool.Put(buf)
+	} else {
+		buf = make([]byte, size)
+	}
+	var deadlineAt time.Time
 	for left := size; left > 0; {
 		n := min(left, int64(len(buf)))
-		rc.SetReadDeadline(time.Now().Add(shard.Stall))
-		// Content-Length says where the last block ends, so a cut-off body is always an error
+		if now := time.Now(); now.Sub(deadlineAt) >= time.Second {
+			rc.SetReadDeadline(now.Add(shard.Stall))
+			deadlineAt = now
+		}
 		if _, err := io.ReadFull(body, buf[:n]); err != nil {
 			return err
 		}
@@ -280,27 +292,33 @@ func (s *Store) get(w http.ResponseWriter, r *http.Request) {
 	defer f.Close()
 	sequential(f)
 	st, err := f.Stat()
-	magic := make([]byte, len(shard.Magic))
+	var magic [len(shard.Magic)]byte
 	if err == nil {
-		_, err = io.ReadFull(f, magic)
+		_, err = io.ReadFull(f, magic[:])
 	}
-	if err != nil || string(magic) != shard.Magic {
+	if err != nil || string(magic[:]) != shard.Magic {
 		http.Error(w, fmt.Sprintf("not a shard file: %v", err), http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	hdr := int64(len(shard.Magic))
-	http.ServeContent(w, r, "", time.Time{}, &deadlineReader{io.NewSectionReader(f, hdr, st.Size()-hdr), http.NewResponseController(w)})
+	http.ServeContent(w, r, "", time.Time{}, &deadlineReader{
+		SectionReader: io.NewSectionReader(f, hdr, st.Size()-hdr),
+		rc:            http.NewResponseController(w),
+	})
 }
 
-// deadlineReader pushes the write deadline forward on every Read, ServeContent reads before each write.
 type deadlineReader struct {
 	*io.SectionReader
-	rc *http.ResponseController
+	rc   *http.ResponseController
+	last time.Time
 }
 
 func (d *deadlineReader) Read(p []byte) (int, error) {
-	d.rc.SetWriteDeadline(time.Now().Add(shard.Stall))
+	if now := time.Now(); now.Sub(d.last) >= time.Second {
+		d.rc.SetWriteDeadline(now.Add(shard.Stall))
+		d.last = now
+	}
 	return d.SectionReader.Read(p)
 }
 
@@ -407,6 +425,9 @@ func (s *Store) Run(ctx context.Context, addr string) {
 }
 
 func sleep(ctx context.Context, d time.Duration) {
+	if d <= 0 {
+		return
+	}
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {

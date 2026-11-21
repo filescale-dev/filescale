@@ -16,10 +16,16 @@ func (s *Store) Metrics(m *metrics.Writer) {
 			write(name, help, v(d), "store", d.id.String(), "dir", d.dir)
 		}
 	}
-	each(m.Gauge, "filescale_disk_free_bytes", "Free bytes on the disk.",
-		func(d *disk) float64 { free, _, _ := diskSpace(d.dir); return float64(free) })
-	each(m.Gauge, "filescale_disk_size_bytes", "Size of the disk.",
-		func(d *disk) float64 { _, total, _ := diskSpace(d.dir); return float64(total) })
+	free, total := make([]int64, len(s.list)), make([]int64, len(s.list))
+	for i, d := range s.list {
+		free[i], total[i], _ = diskSpace(d.dir)
+	}
+	for i, d := range s.list {
+		m.Gauge("filescale_disk_free_bytes", "Free bytes on the disk.", float64(free[i]), "store", d.id.String(), "dir", d.dir)
+	}
+	for i, d := range s.list {
+		m.Gauge("filescale_disk_size_bytes", "Size of the disk.", float64(total[i]), "store", d.id.String(), "dir", d.dir)
+	}
 	each(m.Gauge, "filescale_disk_failed", "1 if the disk failed its last probe: it refuses shards and stops heartbeating.",
 		func(d *disk) float64 { return one(d.failed.Load()) })
 	each(m.Gauge, "filescale_disk_inflight_bytes", "Bytes of shard PUTs in progress.",

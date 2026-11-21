@@ -55,7 +55,7 @@ func (s *Serve) Metrics(m *metrics.Writer) {
 	}
 
 	// the stores table as of the last reload, the same on every serve
-	stores, alive := *s.stores.Load(), s.Alive()
+	stores, alive := s.stores.Load().list, s.Alive()
 	each := func(write func(string, string, float64, ...string), name, help string, v func(db.Store) float64) {
 		for _, st := range stores {
 			write(name, help, v(st), "store", st.ID.String(), "addr", st.Addr)

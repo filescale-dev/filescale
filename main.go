@@ -187,13 +187,7 @@ func runServe(c *commonOpts, o *serveOpts) {
 		DB: d, Client: client,
 		DataShards: o.dataShards, ParityShards: o.parityShards, SmallFileSize: int64(o.smallFileSize),
 		SlowRead: o.slowRead, Token: o.token, TokenFor: o.tokenFor, Only: o.only, AllowInline: o.allowInline,
-		Alive: func() map[string]bool {
-			alive := map[string]bool{}
-			for _, a := range cluster.Addrs(ml, "store") {
-				alive[a] = true
-			}
-			return alive
-		},
+		Alive:  func() map[string]bool { return cluster.AliveStoreAddrs(ml) },
 		Serves: func() ([]string, string) { return cluster.Addrs(ml, "serve"), cluster.Addr(ml, o.port) },
 	})
 	bg, stopBg := context.WithCancel(context.Background())
@@ -268,7 +262,7 @@ func listen(c *commonOpts, port int, h http.Handler, ml *memberlist.Memberlist, 
 		stopBg()
 	}
 	log.Printf("shutting down, waiting up to %v for requests in flight", drainWait)
-	ml.Leave(5 * time.Second) // peers stop sending here now instead of in ~30s
+	cluster.Leave(ml, 5*time.Second) // peers stop sending here now instead of in ~30s
 	dctx, cancel := context.WithTimeout(context.Background(), drainWait)
 	defer cancel()
 	if err := srv.Shutdown(dctx); err != nil {

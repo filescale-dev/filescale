@@ -61,7 +61,7 @@ func (s *Serve) Repair(ctx context.Context, after time.Duration) error {
 // down lists stores not seen for longer than after, never maintenance.
 func (s *Serve) down(after time.Duration) []db.Store {
 	var out []db.Store
-	for _, st := range *s.stores.Load() {
+	for _, st := range s.stores.Load().list {
 		if st.State != "maintenance" && time.Since(st.LastSeen) > after {
 			out = append(out, st)
 		}

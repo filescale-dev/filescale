@@ -47,10 +47,12 @@ type Reader struct {
 	bad     []bool
 	slowed  []bool          // dropped for being slow, not failing: taken back when nothing else is left
 	patient bool            // out of alternatives, no more dropping for slowness
-	held    []time.Duration // how long in a row the shard held up all the others
-	spare   [][]byte        // rebuilt blocks, a dropped shard may still be writing its own slot
-	cur     int64
-	blocks  [][]byte // stripe cur's blocks so far
+	held     []time.Duration // how long in a row the shard held up all the others
+	spare    [][]byte        // rebuilt blocks, a dropped shard may still be writing its own slot
+	cur      int64
+	blocks   [][]byte // stripe cur's blocks so far
+	shards   [][]byte
+	required []bool
 
 	mu     sync.Mutex
 	window int64 // cur, for the stream goroutines
@@ -83,7 +85,8 @@ func NewReader(ctx context.Context, c *Client, f *db.File, addrs []string, first
 	n := len(f.Stores)
 	r := &Reader{Slow: Stall, ctx: ctx, c: c, f: f, l: erasure.Layout{Size: f.Size, Data: f.DataShards}, enc: enc, addrs: addrs,
 		first: first, last: last, cur: first, window: first, wake: make(chan struct{}), notify: make(chan struct{}, 1),
-		streams: make([]*stream, n), bad: make([]bool, n), slowed: make([]bool, n), held: make([]time.Duration, n), spare: make([][]byte, n), blocks: make([][]byte, n)}
+		streams: make([]*stream, n), bad: make([]bool, n), slowed: make([]bool, n), held: make([]time.Duration, n),
+		spare: make([][]byte, n), blocks: make([][]byte, n), shards: make([][]byte, n), required: make([]bool, n)}
 	for k, a := range addrs {
 		r.bad[k] = a == ""
 	}
@@ -338,29 +341,29 @@ func (r *Reader) rebuild(k int) error {
 			r.recv(i)
 		}
 	}
-	shards := make([][]byte, len(r.blocks))
-	required := make([]bool, len(r.blocks))
+	clear(r.shards)
+	clear(r.required)
 	need := false
 	for i, b := range r.blocks {
-		shards[i] = b
+		r.shards[i] = b
 		if b == nil && (i < r.l.Data || i == k) {
 			if r.spare[i] == nil {
 				r.spare[i] = r.slot()
 			}
-			shards[i] = r.spare[i][:0] // reused, cap 64 KiB + 4
-			required[i] = true
+			r.shards[i] = r.spare[i][:0] // reused, cap 64 KiB + 4
+			r.required[i] = true
 			need = true
 		}
 	}
 	if !need {
 		return nil
 	}
-	if err := r.enc.ReconstructSome(shards, required); err != nil {
+	if err := r.enc.ReconstructSome(r.shards, r.required); err != nil {
 		return err
 	}
-	for i, ok := range required {
+	for i, ok := range r.required {
 		if ok {
-			r.blocks[i] = shards[i]
+			r.blocks[i] = r.shards[i]
 		}
 	}
 	r.Rebuilt++

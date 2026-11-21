@@ -41,17 +41,22 @@ type Config struct {
 	Serves func() (all []string, self string)
 }
 
+type storeView struct {
+	list []db.Store
+	byID map[db.UUID]string
+}
+
 type Serve struct {
 	Config
 	counters
-	stores   atomic.Pointer[[]db.Store]
+	stores   atomic.Pointer[storeView]
 	reloaded atomic.Int64 // unix nanos of the last good Reload
 	rebuilt  atomic.Int64 // download stripes rebuilt from parity
 }
 
 func New(cfg Config) *Serve {
 	s := &Serve{Config: cfg}
-	s.stores.Store(&[]db.Store{})
+	s.stores.Store(&storeView{})
 	return s
 }
 
@@ -61,7 +66,11 @@ func (s *Serve) Reload(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	s.stores.Store(&stores)
+	byID := make(map[db.UUID]string, len(stores))
+	for _, st := range stores {
+		byID[st.ID] = st.Addr
+	}
+	s.stores.Store(&storeView{list: stores, byID: byID})
 	s.reloaded.Store(time.Now().UnixNano())
 	return nil
 }
@@ -214,7 +223,7 @@ func (s *Serve) pick(n int, size int64, skip map[string]bool, prefer []db.UUID) 
 	alive := s.Alive()
 	up, roomy := map[string]bool{}, map[string]bool{}
 	var room []db.Store
-	for _, st := range *s.stores.Load() {
+	for _, st := range s.stores.Load().list {
 		if !usable(st, alive) || skip[st.Addr] {
 			continue
 		}
@@ -290,10 +299,7 @@ func (s *Serve) addrs(f *db.File) []string {
 
 // tableAddrs maps a file's shards to their stores.addr, live or not.
 func (s *Serve) tableAddrs(f *db.File) []string {
-	byID := map[db.UUID]string{}
-	for _, st := range *s.stores.Load() {
-		byID[st.ID] = st.Addr
-	}
+	byID := s.stores.Load().byID
 	out := make([]string, len(f.Stores))
 	for i, id := range f.Stores {
 		out[i] = byID[id]

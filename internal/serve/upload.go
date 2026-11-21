@@ -311,16 +311,17 @@ func (s *Serve) commit(ctx context.Context, f *db.File, oldest time.Time, resume
 
 // job is one PUT's stripe loop, its buffers sized to the first part it sends and reused for the rest.
 type job struct {
-	ctx    context.Context
-	cancel context.CancelCauseFunc
-	rc     *http.ResponseController
-	body   io.Reader
-	h      hash.Hash
-	head   []byte              // the first 512 bytes, to guess a content type
-	enc    reedsolomon.Encoder // nil with 1 data shard: the parity shards are plain copies
-	buf    []byte
-	parity [][]byte
-	blocks [][]byte
+	ctx        context.Context
+	cancel     context.CancelCauseFunc
+	rc         *http.ResponseController
+	body       io.Reader
+	h          hash.Hash
+	head       []byte              // the first 512 bytes, to guess a content type
+	enc        reedsolomon.Encoder // nil with 1 data shard: the parity shards are plain copies
+	buf        []byte
+	parity     [][]byte
+	blocks     [][]byte
+	deadlineAt time.Time
 }
 
 func newJob(ctx context.Context, cancel context.CancelCauseFunc, w http.ResponseWriter, body io.Reader, h hash.Hash, l erasure.Layout, parity int) (*job, error) {
@@ -348,7 +349,10 @@ func (j *job) stream(l erasure.Layout, puts []*put, lead time.Duration, near fun
 		bs := l.BlockLen(st)
 		sent := st * l.StripeSize()
 		n := min(l.StripeSize(), l.Size-sent)
-		j.rc.SetReadDeadline(time.Now().Add(clientStall))
+		if now := time.Now(); now.Sub(j.deadlineAt) >= time.Second {
+			j.rc.SetReadDeadline(now.Add(clientStall))
+			j.deadlineAt = now
+		}
 		if _, err := io.ReadFull(j.body, j.buf[:n]); err != nil {
 			return &statusError{http.StatusBadRequest, "reading upload: " + err.Error()}
 		}

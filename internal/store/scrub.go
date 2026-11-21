@@ -133,13 +133,12 @@ type pace struct {
 
 // scrubDisk scrubs one disk's buckets from p.next on, see pace.
 func (s *Store) scrubDisk(ctx context.Context, d *disk, p pace, since time.Time) error {
+	buf := make([]byte, erasure.BlockSize+4)
 	var failed int
 	var first error
 	for b := p.next; b < db.Buckets; b++ {
 		if p.pass > 0 {
-			if wait := time.Until(p.start.Add(p.pass / db.Buckets * time.Duration(b))); wait > 0 {
-				sleep(ctx, wait)
-			}
+			sleep(ctx, time.Until(p.start.Add(p.pass/db.Buckets*time.Duration(b))))
 		}
 		if err := ctx.Err(); err != nil {
 			return err
@@ -156,7 +155,7 @@ func (s *Store) scrubDisk(ctx context.Context, d *disk, p pace, since time.Time)
 			if row.Written.Before(since) {
 				continue
 			}
-			if _, err := s.scrubShard(ctx, d, row); err != nil {
+			if _, err := s.scrubShard(ctx, d, row, buf); err != nil {
 				log.Printf("scrub %s shard %d: %v", row.FileID, row.Index, err)
 			}
 		}
@@ -252,7 +251,7 @@ func (s *Store) scrubLoop(ctx context.Context, d *disk) {
 	}
 }
 
-func (s *Store) scrubShard(ctx context.Context, d *disk, row db.Shard) (int64, error) {
+func (s *Store) scrubShard(ctx context.Context, d *disk, row db.Shard, buf []byte) (int64, error) {
 	f, err := s.DB.File(ctx, row.Name)
 	if err != nil {
 		return 0, err
@@ -301,13 +300,12 @@ func (s *Store) scrubShard(ctx context.Context, d *disk, row db.Shard) (int64, e
 	}
 	defer file.Close()
 	sequential(file)
-	magic := make([]byte, hdr)
-	if _, err := file.ReadAt(magic, 0); err != nil || string(magic) != shard.Magic {
+	var magic [len(shard.Magic)]byte
+	if _, err := file.ReadAt(magic[:], 0); err != nil || string(magic[:]) != shard.Magic {
 		if _, err := file.WriteAt([]byte(shard.Magic), 0); err != nil {
 			return 0, err
 		}
 	}
-	buf := make([]byte, erasure.BlockSize+4)
 	var bad []int64
 	var read int64
 	for st := range l.Stripes() {

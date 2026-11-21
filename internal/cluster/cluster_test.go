@@ -26,6 +26,9 @@ func TestJoin(t *testing.T) {
 	if got := Addrs(b, "store"); !slices.Equal(got, []string{"127.0.0.1:8081"}) {
 		t.Errorf("store addrs = %v", got)
 	}
+	if got := AliveStoreAddrs(b); !got["127.0.0.1:8081"] || len(got) != 1 {
+		t.Errorf("alive store addrs = %v", got)
+	}
 	if got := Addrs(b, "serve"); !slices.Equal(got, []string{Addr(b, 8080)}) {
 		t.Errorf("serve addrs = %v, want %s", got, Addr(b, 8080))
 	}
@@ -66,7 +69,7 @@ func node(t *testing.T, port int, secret string, meta Meta) *memberlist.Memberli
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { ml.Shutdown() })
+	t.Cleanup(func() { Leave(ml, time.Second); ml.Shutdown() })
 	return ml
 }
 
@@ -117,7 +120,7 @@ func TestServeSettingsWarning(t *testing.T) {
 	var buf bytes.Buffer
 	log.SetOutput(&buf)
 	defer log.SetOutput(os.Stderr)
-	e := events(Meta{Role: "serve", DataShards: 8, ParityShards: 4, SmallFileSize: 1 << 20})
+	e := newEvents(Meta{Role: "serve", DataShards: 8, ParityShards: 4, SmallFileSize: 1 << 20})
 	meta, err := json.Marshal(Meta{Role: "serve", DataShards: 10, ParityShards: 4, SmallFileSize: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
