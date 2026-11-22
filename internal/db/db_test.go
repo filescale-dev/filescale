@@ -2,16 +2,27 @@ package db
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
 func TestMem(t *testing.T) { testDB(t, NewMem()) }
 
 func TestCassandra(t *testing.T) {
+	c := connectTestCassandra(t)
+	testDB(t, c)
+}
+
+func connectTestCassandra(t *testing.T) *Cassandra {
+	t.Helper()
 	hosts := os.Getenv("FILESCALE_CASSANDRA")
 	if hosts == "" {
 		t.Skip("set FILESCALE_CASSANDRA=host1,host2 to run against Cassandra")
@@ -20,8 +31,194 @@ func TestCassandra(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
-	testDB(t, c)
+	t.Cleanup(c.Close)
+	return c
+}
+
+// Concurrent writes to one name never merge stores or mix rows.
+func TestCassandraFilesConcurrency(t *testing.T) {
+	c := connectTestCassandra(t)
+	ctx := context.Background()
+	uuids := func(n int) []UUID {
+		s := make([]UUID, n)
+		for i := range s {
+			s[i] = newID(t)
+		}
+		return s
+	}
+
+	t.Run("concurrent_put_file", func(t *testing.T) {
+		name := "repro/concurrent-put-" + newID(t).String()
+		t.Cleanup(func() { c.DeleteFile(ctx, name) })
+		const workers = 32
+		const rounds = 50
+		for round := range rounds {
+			wantByID := make(map[UUID][]UUID, workers)
+			files := make([]*File, workers)
+			for i := range workers {
+				id := newID(t)
+				st := uuids(5)
+				wantByID[id] = st
+				files[i] = &File{Name: name, ID: id, Size: 76224, BLAKE3: make([]byte, 32), ContentType: "application/octet-stream",
+					DataShards: 1, ParityShards: 4, Stores: st}
+			}
+			start := make(chan struct{})
+			var wg sync.WaitGroup
+			for _, f := range files {
+				wg.Go(func() {
+					<-start
+					if err := c.PutFile(ctx, f); err != nil {
+						t.Errorf("round %d PutFile: %v", round, err)
+					}
+				})
+			}
+			close(start)
+			wg.Wait()
+			got, err := c.File(ctx, name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got == nil {
+				t.Fatalf("round %d: File returned nil", round)
+			}
+			if err := got.CheckLayout(); err != nil {
+				t.Fatalf("round %d: CheckLayout failed: %v (stores=%v)", round, err, got.Stores)
+			}
+			if want, ok := wantByID[got.ID]; !ok || !slices.Equal(got.Stores, want) {
+				t.Fatalf("round %d: mixed row fields for id %s: got stores %v, want %v", round, got.ID, got.Stores, want)
+			}
+		}
+	})
+
+	t.Run("repair_racing_put_file", func(t *testing.T) {
+		name := "repro/repair-vs-put-" + newID(t).String()
+		t.Cleanup(func() { c.DeleteFile(ctx, name) })
+		for round := range 50 {
+			f1 := &File{Name: name, ID: newID(t), Size: 76224, BLAKE3: make([]byte, 32), ContentType: "application/octet-stream",
+				DataShards: 1, ParityShards: 4, Stores: uuids(5)}
+			if err := c.PutFile(ctx, f1); err != nil {
+				t.Fatal(err)
+			}
+			f2 := &File{Name: name, ID: newID(t), Size: 76224, BLAKE3: make([]byte, 32), ContentType: "application/octet-stream",
+				DataShards: 1, ParityShards: 4, Stores: uuids(5)}
+			rep := newID(t)
+			start := make(chan struct{})
+			var wg sync.WaitGroup
+			wg.Go(func() {
+				<-start
+				if err := c.PutFile(ctx, f2); err != nil {
+					t.Errorf("round %d PutFile: %v", round, err)
+				}
+			})
+			wg.Go(func() {
+				<-start
+				if _, err := c.SetShardStore(ctx, name, f1.ID, 2, rep); err != nil {
+					t.Errorf("round %d SetShardStore: %v", round, err)
+				}
+			})
+			close(start)
+			wg.Wait()
+			got, err := c.File(ctx, name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got == nil {
+				t.Fatalf("round %d: File returned nil", round)
+			}
+			if err := got.CheckLayout(); err != nil {
+				t.Fatalf("round %d: CheckLayout failed: %v (stores=%v)", round, err, got.Stores)
+			}
+			if got.ID == f2.ID && !slices.Equal(got.Stores, f2.Stores) {
+				t.Fatalf("round %d: f2 stores corrupted by repair: got %v, want %v", round, got.Stores, f2.Stores)
+			}
+		}
+	})
+
+	t.Run("delete_racing_put_and_repair", func(t *testing.T) {
+		name := "repro/delete-race-" + newID(t).String()
+		t.Cleanup(func() { c.DeleteFile(ctx, name) })
+		for round := range 50 {
+			f1 := &File{Name: name, ID: newID(t), Size: 76224, BLAKE3: make([]byte, 32), ContentType: "application/octet-stream",
+				DataShards: 1, ParityShards: 4, Stores: uuids(5)}
+			if err := c.PutFile(ctx, f1); err != nil {
+				t.Fatal(err)
+			}
+			f2 := &File{Name: name, ID: newID(t), Size: 76224, BLAKE3: make([]byte, 32), ContentType: "application/octet-stream",
+				DataShards: 1, ParityShards: 4, Stores: uuids(5)}
+			start := make(chan struct{})
+			var wg sync.WaitGroup
+			wg.Go(func() {
+				<-start
+				if err := c.DeleteFile(ctx, name); err != nil {
+					t.Errorf("round %d DeleteFile: %v", round, err)
+				}
+			})
+			wg.Go(func() {
+				<-start
+				if err := c.PutFile(ctx, f2); err != nil {
+					t.Errorf("round %d PutFile: %v", round, err)
+				}
+			})
+			wg.Go(func() {
+				<-start
+				if _, err := c.SetShardStore(ctx, name, f1.ID, 2, newID(t)); err != nil {
+					t.Errorf("round %d SetShardStore: %v", round, err)
+				}
+			})
+			close(start)
+			wg.Wait()
+			got, err := c.File(ctx, name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != nil {
+				if err := got.CheckLayout(); err != nil {
+					t.Fatalf("round %d: CheckLayout failed after delete race: %v (row=%+v)", round, err, got)
+				}
+			}
+		}
+	})
+
+	t.Run("overwrite_resets_all_fields", func(t *testing.T) {
+		name := "repro/overwrite-" + newID(t).String()
+		t.Cleanup(func() { c.DeleteFile(ctx, name) })
+		p0, p1 := newID(t), newID(t)
+		multi := &File{Name: name, ID: newID(t), Size: 15, BLAKE3: []byte{1, 2}, ContentType: "video/mp4",
+			DataShards: 1, ParityShards: 4, Stores: uuids(10), Parts: []UUID{p0, p1}, PartSize: 10}
+		if err := c.PutFile(ctx, multi); err != nil {
+			t.Fatal(err)
+		}
+		single := &File{Name: name, ID: newID(t), Size: 76224, BLAKE3: []byte{3, 4}, ContentType: "text/plain",
+			DataShards: 1, ParityShards: 4, Stores: uuids(5)}
+		if err := c.PutFile(ctx, single); err != nil {
+			t.Fatal(err)
+		}
+		got, err := c.File(ctx, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := got.CheckLayout(); err != nil {
+			t.Fatalf("after multi->single overwrite: %v (%+v)", err, got)
+		}
+		if got.ID != single.ID || !slices.Equal(got.Stores, single.Stores) || len(got.Parts) != 0 || got.PartSize != 0 {
+			t.Fatalf("after multi->single overwrite = %+v, want %+v", got, single)
+		}
+		empty := &File{Name: name, ID: newID(t), Size: 0, BLAKE3: make([]byte, 32), ContentType: "application/octet-stream",
+			DataShards: 1, ParityShards: 4}
+		if err := c.PutFile(ctx, empty); err != nil {
+			t.Fatal(err)
+		}
+		got, err = c.File(ctx, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := got.CheckLayout(); err != nil {
+			t.Fatalf("after single->empty overwrite: %v (%+v)", err, got)
+		}
+		if got.ID != empty.ID || len(got.Stores) != 0 || got.Size != 0 {
+			t.Fatalf("after single->empty overwrite = %+v, want %+v", got, empty)
+		}
+	})
 }
 
 // testDB checks the behavior serve and store rely on, for any DB.
@@ -240,6 +437,32 @@ func TestMemTTLOfUploads(t *testing.T) {
 	m.PutPart(ctx, UploadPart{Name: "t", UploadID: up, Index: 1, ID: newID(t), Total: 10})
 	if rows, err := m.UploadParts(ctx, "t", up); err != nil || len(rows) != 1 || rows[0].Index != 1 {
 		t.Fatalf("rows = %+v, %v", rows, err)
+	}
+}
+
+func TestAmbiguous(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want bool
+	}{
+		{&gocql.RequestErrWriteTimeout{WriteType: "CAS"}, true},
+		{fmt.Errorf("wrapped: %w", &gocql.RequestErrWriteTimeout{WriteType: "CAS"}), true},
+		{&gocql.RequestErrCASWriteUnknown{}, true},
+		{&gocql.RequestErrWriteTimeout{WriteType: "SIMPLE"}, false},
+		{errors.New("boom"), false},
+		{context.Canceled, false},
+	} {
+		if got := ambiguous(tc.err); got != tc.want {
+			t.Errorf("ambiguous(%v) = %v, want %v", tc.err, got, tc.want)
+		}
+	}
+}
+
+func TestBackoffCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := backoff(ctx, lwtAttempts); !errors.Is(err, context.Canceled) {
+		t.Fatalf("backoff on a canceled ctx = %v, want Canceled", err)
 	}
 }
 

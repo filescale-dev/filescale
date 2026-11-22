@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"time"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
@@ -83,9 +84,35 @@ func (c *Cassandra) File(ctx context.Context, name string) (*File, error) {
 	return &f, nil
 }
 
+// PutFile is an LWT: plain writes at one timestamp merge their stores lists.
 func (c *Cassandra) PutFile(ctx context.Context, f *File) error {
-	return c.s.Query(`INSERT INTO files (name, file_id, size, blake3, content_type, data_shards, parity_shards, stores, parts, part_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		f.Name, f.ID, f.Size, f.BLAKE3, f.ContentType, f.DataShards, f.ParityShards, f.Stores, f.Parts, f.PartSize).ExecContext(ctx)
+	for attempt := 0; ; attempt++ {
+		ok, err := c.s.Query(`INSERT INTO files (name, file_id, size, blake3, content_type, data_shards, parity_shards, stores, parts, part_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS`,
+			f.Name, f.ID, f.Size, f.BLAKE3, f.ContentType, f.DataShards, f.ParityShards, f.Stores, f.Parts, f.PartSize).
+			MapScanCASContext(ctx, map[string]any{})
+		if err == nil && !ok {
+			ok, err = c.s.Query(`UPDATE files SET file_id = ?, size = ?, blake3 = ?, content_type = ?, data_shards = ?, parity_shards = ?, stores = ?, parts = ?, part_size = ? WHERE name = ? IF EXISTS`,
+				f.ID, f.Size, f.BLAKE3, f.ContentType, f.DataShards, f.ParityShards, f.Stores, f.Parts, f.PartSize, f.Name).
+				MapScanCASContext(ctx, map[string]any{})
+		}
+		if err != nil {
+			if ambiguous(err) {
+				if id, found, rerr := c.serialFileID(ctx, f.Name); rerr == nil && found && id == f.ID {
+					return nil
+				}
+			}
+			return err
+		}
+		if ok {
+			return nil
+		}
+		if attempt+1 == lwtAttempts {
+			return fmt.Errorf("files row %s kept changing", f.Name)
+		}
+		if err := backoff(ctx, attempt); err != nil {
+			return err
+		}
+	}
 }
 
 func (c *Cassandra) PutPart(ctx context.Context, p UploadPart) error {
@@ -109,13 +136,59 @@ func (c *Cassandra) UploadParts(ctx context.Context, name string, upload UUID) (
 	return out, iter.Close()
 }
 
+// DeleteFile is never retried: a resend could delete a newer upload.
 func (c *Cassandra) DeleteFile(ctx context.Context, name string) error {
-	return c.s.Query(`DELETE FROM files WHERE name = ?`, name).ExecContext(ctx)
+	_, err := c.s.Query(`DELETE FROM files WHERE name = ? IF EXISTS`, name).MapScanCASContext(ctx, map[string]any{})
+	if err != nil && ambiguous(err) {
+		if _, found, rerr := c.serialFileID(ctx, name); rerr == nil && !found {
+			return nil
+		}
+	}
+	return err
 }
 
 func (c *Cassandra) SetShardStore(ctx context.Context, name string, fileID UUID, shard int, store UUID) (bool, error) {
-	var cur UUID
-	return c.s.Query(`UPDATE files SET stores[?] = ? WHERE name = ? IF file_id = ?`, shard, store, name, fileID).ScanCASContext(ctx, &cur)
+	for attempt := 0; ; attempt++ {
+		var cur UUID
+		ok, err := c.s.Query(`UPDATE files SET stores[?] = ? WHERE name = ? IF file_id = ?`, shard, store, name, fileID).ScanCASContext(ctx, &cur)
+		if err == nil || !ambiguous(err) || attempt+1 == lwtAttempts {
+			return ok, err
+		}
+		if err := backoff(ctx, attempt); err != nil {
+			return false, err
+		}
+	}
+}
+
+func (c *Cassandra) serialFileID(ctx context.Context, name string) (id UUID, found bool, err error) {
+	err = c.s.Query(`SELECT file_id FROM files WHERE name = ?`, name).Consistency(gocql.LocalSerial).ScanContext(ctx, &id)
+	if errors.Is(err, gocql.ErrNotFound) {
+		return id, false, nil
+	}
+	return id, err == nil, err
+}
+
+const lwtAttempts = 8
+
+func ambiguous(err error) bool {
+	var wt *gocql.RequestErrWriteTimeout
+	if errors.As(err, &wt) {
+		return wt.WriteType == "CAS"
+	}
+	var unk *gocql.RequestErrCASWriteUnknown
+	return errors.As(err, &unk)
+}
+
+func backoff(ctx context.Context, attempt int) error {
+	d := min(5*time.Millisecond<<attempt, 200*time.Millisecond)
+	t := time.NewTimer(d/2 + rand.N(d))
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 func (c *Cassandra) PutShard(ctx context.Context, s Shard) error {
