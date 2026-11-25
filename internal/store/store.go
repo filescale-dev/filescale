@@ -26,11 +26,13 @@ import (
 var blockPool = sync.Pool{New: func() any { return make([]byte, erasure.BlockSize+4) }}
 
 type Config struct {
-	Dirs    []string
-	MinFree int64 // percent of each disk kept for repairs
-	Token   string
-	DB      db.DB
-	Client  *shard.Client // fetches other shards when scrub finds a bad block
+	Dirs      []string
+	MinFree   int64 // percent of each disk kept for repairs
+	Token     string
+	DB        db.DB
+	Client    *shard.Client // fetches other shards when scrub finds a bad block
+	ScrubPass time.Duration // paced scrub pass length; 0 = DefaultScrubPass
+	ScrubGap  time.Duration // pause between scrub passes
 }
 
 type Store struct {
@@ -53,6 +55,15 @@ type disk struct {
 }
 
 func New(cfg Config) (*Store, error) {
+	if cfg.ScrubPass < 0 {
+		return nil, fmt.Errorf("scrubPass %v: want >= 0", cfg.ScrubPass)
+	}
+	if cfg.ScrubGap < 0 {
+		return nil, fmt.Errorf("scrubGap %v: want >= 0", cfg.ScrubGap)
+	}
+	if cfg.ScrubPass == 0 {
+		cfg.ScrubPass = DefaultScrubPass
+	}
 	stores, err := cfg.DB.Stores(context.Background())
 	if err != nil {
 		return nil, err
@@ -388,9 +399,8 @@ func (s *Store) CrashedSince(ctx context.Context) time.Time {
 }
 
 // Run gives every disk its own loops, so a slow or stuck disk never holds up the others:
-// a heartbeat every minute, a scrub spread over 4 weeks with a day between passes (a pass reads
-// all 65,536 index buckets, even on an empty disk, and resumes after a restart), and a cleanup
-// spread over each day.
+// a heartbeat every minute, paced scrub passes over ScrubPass with ScrubGap between them
+// (resuming after a restart), and a cleanup spread over each day.
 func (s *Store) Run(ctx context.Context, addr string) {
 	since := s.CrashedSince(ctx) // before the first heartbeat replaces last_seen
 	if !since.IsZero() {

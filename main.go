@@ -56,6 +56,8 @@ type storeOpts struct {
 	port         int
 	dirs         []string
 	minFreeSpace int
+	scrubPass    time.Duration
+	scrubGap     time.Duration
 }
 
 func commonFlags(fs *flag.FlagSet) *commonOpts {
@@ -92,6 +94,8 @@ func storeFlags(fs *flag.FlagSet) *storeOpts {
 	fs.IntVar(&o.port, "port", 8081, "HTTP port for shard traffic")
 	listVar(fs, &o.dirs, "dir", "comma-separated directories to keep shards in, one store_id each (default ./data)")
 	fs.IntVar(&o.minFreeSpace, "minFreeSpace", 5, "percent of each disk kept free: below it new upload shards are refused, repairs may use it")
+	fs.DurationVar(&o.scrubPass, "scrubPass", store.DefaultScrubPass, "how long a paced scrub pass takes")
+	fs.DurationVar(&o.scrubGap, "scrubGap", store.DefaultScrubGap, "pause between scrub passes")
 	return o
 }
 
@@ -171,6 +175,12 @@ func main() {
 		}
 		if o.minFreeSpace < 0 || o.minFreeSpace > 100 {
 			log.Fatalf("-minFreeSpace %d: want 0-100", o.minFreeSpace)
+		}
+		if o.scrubPass <= 0 {
+			log.Fatalf("-scrubPass %v: want > 0", o.scrubPass)
+		}
+		if o.scrubGap < 0 {
+			log.Fatalf("-scrubGap %v: want >= 0", o.scrubGap)
 		}
 		if code, parent := supervise(c, o.port); parent {
 			os.Exit(code)
@@ -293,8 +303,10 @@ func runStore(c *commonOpts, o *storeOpts) {
 	d := connect(c)
 	defer d.Close()
 	client, rtt := newClient(c.secret)
-	st, err := store.New(store.Config{Dirs: o.dirs, MinFree: int64(o.minFreeSpace), Token: cluster.APIToken(c.secret),
-		DB: d, Client: client})
+	st, err := store.New(store.Config{
+		Dirs: o.dirs, MinFree: int64(o.minFreeSpace), Token: cluster.APIToken(c.secret),
+		DB: d, Client: client, ScrubPass: o.scrubPass, ScrubGap: o.scrubGap,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}

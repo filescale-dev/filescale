@@ -19,6 +19,7 @@ import (
 
 	"filescale/internal/cluster"
 	"filescale/internal/metrics"
+	"filescale/internal/store"
 )
 
 // -metricsPort serves the process metrics and the role's own at /metrics.
@@ -53,6 +54,17 @@ func TestDrainWaitFlag(t *testing.T) {
 	}
 	if err := fs.Parse([]string{"-drainWait=2m"}); err != nil || c.drainWait != 2*time.Minute {
 		t.Fatalf("custom -drainWait = %v, %v: want 2m", c.drainWait, err)
+	}
+}
+
+func TestScrubFlags(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	o := storeFlags(fs)
+	if err := fs.Parse(nil); err != nil || o.scrubPass != store.DefaultScrubPass || o.scrubGap != store.DefaultScrubGap {
+		t.Fatalf("default scrub flags = (%v, %v), %v", o.scrubPass, o.scrubGap, err)
+	}
+	if err := fs.Parse([]string{"-scrubPass=168h", "-scrubGap=0"}); err != nil || o.scrubPass != 168*time.Hour || o.scrubGap != 0 {
+		t.Fatalf("custom scrub flags = (%v, %v), %v", o.scrubPass, o.scrubGap, err)
 	}
 }
 
@@ -319,6 +331,9 @@ func TestCLIValidationBeforeSupervise(t *testing.T) {
 		{"serve", "-drainWait", "-1s"},
 		{"serve", "-dataShards", "0"},
 		{"store", "-minFreeSpace", "101"},
+		{"store", "-scrubPass", "0"},
+		{"store", "-scrubPass", "-1s"},
+		{"store", "-scrubGap", "-1s"},
 	} {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		out, err := exec.CommandContext(ctx, bin, args...).CombinedOutput()

@@ -92,16 +92,16 @@ func (s *Store) cleanDisk(ctx context.Context, d *disk, pass time.Duration) erro
 	return err
 }
 
-// scrubPass is how long a paced scrub pass takes, scrubGap the pause between passes.
+// Default scrub pacing: a 28-day pass with a 24h pause between passes.
 const (
-	scrubPass = 28 * 24 * time.Hour
-	scrubGap  = 24 * time.Hour
+	DefaultScrubPass = 28 * 24 * time.Hour
+	DefaultScrubGap  = 24 * time.Hour
 )
 
 // Scrub goes through every index row of this store's disks: rebuilds bad blocks, and
 // whole shards a crash lost before writeback, from the file's other shards, and drops
 // orphaned rows. Rows, not files, so a missing file is found too. Disks run in parallel,
-// paced = each spreads its buckets over scrubPass, else full speed. Rows written before since are skipped.
+// paced = each spreads its buckets over ScrubPass, else full speed. Rows written before since are skipped.
 func (s *Store) Scrub(ctx context.Context, paced bool, since time.Time) error {
 	errs := make([]error, len(s.list))
 	var wg sync.WaitGroup
@@ -109,7 +109,7 @@ func (s *Store) Scrub(ctx context.Context, paced bool, since time.Time) error {
 		wg.Go(func() {
 			p := pace{}
 			if paced {
-				p = pace{start: time.Now(), pass: scrubPass}
+				p = pace{start: time.Now(), pass: s.ScrubPass}
 			}
 			if err := s.scrubDisk(ctx, d, p, since); err != nil {
 				errs[i] = fmt.Errorf("disk %s: %w", d.dir, err)
@@ -131,6 +131,10 @@ type pace struct {
 	save  func(next int) // records progress every 256 buckets, nil = don't
 }
 
+func bucketOffset(pass time.Duration, b int) time.Duration {
+	return pass/db.Buckets*time.Duration(b) + pass%db.Buckets*time.Duration(b)/db.Buckets
+}
+
 // scrubDisk scrubs one disk's buckets from p.next on, see pace.
 func (s *Store) scrubDisk(ctx context.Context, d *disk, p pace, since time.Time) error {
 	buf := make([]byte, erasure.BlockSize+4)
@@ -138,7 +142,7 @@ func (s *Store) scrubDisk(ctx context.Context, d *disk, p pace, since time.Time)
 	var first error
 	for b := p.next; b < db.Buckets; b++ {
 		if p.pass > 0 {
-			sleep(ctx, time.Until(p.start.Add(p.pass/db.Buckets*time.Duration(b))))
+			sleep(ctx, time.Until(p.start.Add(bucketOffset(p.pass, b))))
 		}
 		if err := ctx.Err(); err != nil {
 			return err
@@ -176,16 +180,16 @@ func (s *Store) scrubDisk(ctx context.Context, d *disk, p pace, since time.Time)
 }
 
 // scrubState is a disk's paced scrub progress, kept in <dir>/scrub so a restart resumes
-// the pass where it was instead of starting 4 weeks over.
+// the pass where it was instead of starting over.
 type scrubState struct {
-	start time.Time // bucket b is due at start + scrubPass × b/65,536
+	start time.Time // bucket b is due at start + pass × b/65,536
 	next  int       // first bucket not scrubbed yet in this pass
 	last  time.Time // end of the last whole pass, zero = none yet
 }
 
 // loadScrub reads d's scrub progress, a fresh pass from now if there's none (or it's unreadable).
-// A pass that fell behind (the store was down) is rebased to now, so it doesn't rush to catch up.
-func loadScrub(d *disk) scrubState {
+// Rebased to now when behind or past the configured pass/gap (downtime or changed flags).
+func loadScrub(d *disk, pass, gap time.Duration) scrubState {
 	now := time.Now()
 	st := scrubState{start: now}
 	b, err := os.ReadFile(filepath.Join(d.dir, "scrub"))
@@ -203,8 +207,15 @@ func loadScrub(d *disk) scrubState {
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		log.Printf("scrub %s: %v, starting a new pass", d.dir, err)
 	}
-	if behind := now.Add(-scrubPass / db.Buckets * time.Duration(st.next)); behind.After(st.start) {
+	off := bucketOffset(pass, st.next)
+	if behind := now.Add(-off); behind.After(st.start) {
 		st.start = behind
+	} else if st.next > 0 {
+		if step := max(bucketOffset(pass, 1), time.Nanosecond); st.start.Add(off).After(now.Add(step)) {
+			st.start = behind
+		}
+	} else if limit := now.Add(gap); st.start.After(limit) {
+		st.start = limit
 	}
 	if !st.last.IsZero() {
 		d.scrubbed.Store(st.last.UnixNano())
@@ -228,11 +239,11 @@ func saveScrub(d *disk, st scrubState) {
 	}
 }
 
-// scrubLoop scrubs d forever, paced passes with scrubGap between them, resuming a pass after a restart.
+// scrubLoop scrubs d forever, paced passes with ScrubGap between them, resuming a pass after a restart.
 func (s *Store) scrubLoop(ctx context.Context, d *disk) {
-	st := loadScrub(d)
+	st := loadScrub(d, s.ScrubPass, s.ScrubGap)
 	for ctx.Err() == nil {
-		p := pace{start: st.start, pass: scrubPass, next: st.next, save: func(next int) {
+		p := pace{start: st.start, pass: s.ScrubPass, next: st.next, save: func(next int) {
 			st.next = next
 			saveScrub(d, st)
 		}}
@@ -243,7 +254,7 @@ func (s *Store) scrubLoop(ctx context.Context, d *disk) {
 			log.Printf("scrub %s: %v", d.dir, err)
 		}
 		now := time.Now()
-		st = scrubState{start: now.Add(scrubGap), last: st.last}
+		st = scrubState{start: now.Add(s.ScrubGap), last: st.last}
 		if last := d.scrubbed.Load(); last > 0 {
 			st.last = time.Unix(0, last)
 		}

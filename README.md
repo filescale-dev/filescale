@@ -5,7 +5,7 @@ filescale is an opinionated erasure code-first file store using HTTP. Here are a
 - **Erasure-coded**: filescale uses [Reed-Solomon erasure coding]((https://www.backblaze.com/blog/reed-solomon/)), with 8+4 as the default ratio (this can be changed, see the [flags](#flags)). **However**, small files are replicated instead. Existing shards are never rebalanced; they only move when repaired.
 - **Resumable uploads**: Resuming is at part boundaries (64 MiB, or file size / 64 for larger files), and unfinished uploads expire after 23h. See the [client API](#client-api) for implementation.
 - **Durable writes**: An upload is acknowledged only once every data and parity shard has landed on its store. If a server dies mid-upload, the request fails and the same PUT can simply be retried (a resumable upload keeps its finished parts).
-- **Self-healing**: Shards of a store that has been down for `-repairAfter` (24h) are rebuilt on other stores. Stores also scrub their shards on a roughly monthly cycle and remove deleted or abandoned data after 24h.
+- **Self-healing**: Shards of a store that has been down for `-repairAfter` (24h) are rebuilt on other stores. Stores also scrub their shards over `-scrubPass` (672h / 28d) with `-scrubGap` (24h) between passes and remove deleted or abandoned data after 24h.
 - **Stateless serves**: Any serve can upload, resume, download or repair. Add them behind DNS round robin or a load balancer for more bandwidth.
 - **Flat names**: The URL path is the key. There is no listing or versioning: `PUT` overwrites, `DELETE` removes, and downloads are attachments by default.
 - **Plain HTTP**: no TLS and no user accounts, just an optional bearer token on the client API. Keep serves, stores and Cassandra on a private network or front them with TLS.
@@ -106,6 +106,8 @@ curl -X DELETE http://127.0.0.1:8080/photos/cat.jpg
 | `-port` | 8081 | shard traffic port |
 | `-dir` | ./data | shard directories, one `store_id` each |
 | `-minFreeSpace` | 5 | percent of each disk kept free, repairs may still use it |
+| `-scrubPass` | 672h | how long a paced scrub pass takes (28 days) |
+| `-scrubGap` | 24h | pause between scrub passes |
 
 ## Build
 
@@ -309,7 +311,7 @@ Alerts worth setting up:
 - A store's `filescale_slow_drops_total` or `filescale_put_refused_total` climbing
 - `filescale_stores_reloaded_timestamp_seconds` is over 2 minutes old
 - no repair pass in 2 hours
-- no scrub pass in 5 weeks.
+- no scrub pass in 5 weeks (or longer than `-scrubPass` + `-scrubGap`).
 
 ### serve and store
 

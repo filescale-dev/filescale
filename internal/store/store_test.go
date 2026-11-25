@@ -505,13 +505,13 @@ func TestScrubPaced(t *testing.T) {
 }
 
 // A paced pass saves its progress every 256 buckets, a restart resumes from there, rebased to now
-// when it fell behind, and the last whole pass's end survives for the metric.
+// when it fell behind or the scrub timing changed, and the last whole pass's end survives for the metric.
 func TestScrubProgress(t *testing.T) {
 	s, _, _ := newStore(t, 5)
 	d := s.list[0]
 	ctx := context.Background()
 
-	if st := loadScrub(d); st.next != 0 || !st.last.IsZero() || time.Since(st.start) > time.Second {
+	if st := loadScrub(d, DefaultScrubPass, DefaultScrubGap); st.next != 0 || !st.last.IsZero() || time.Since(st.start) > time.Second {
 		t.Fatalf("fresh disk: %+v, want a new pass from now", st)
 	}
 
@@ -532,29 +532,119 @@ func TestScrubProgress(t *testing.T) {
 		t.Errorf("saved at %v, want [256 512]", saved)
 	}
 	d.scrubbed.Store(0)
-	st := loadScrub(d)
+	st := loadScrub(d, DefaultScrubPass, DefaultScrubGap)
 	if st.next != 512 {
 		t.Errorf("resumed at bucket %d, want 512", st.next)
 	}
-	if due := st.start.Add(scrubPass / db.Buckets * 512); time.Until(due) > time.Second || time.Since(due) > time.Second {
+	if due := st.start.Add(bucketOffset(DefaultScrubPass, 512)); time.Until(due) > time.Second || time.Since(due) > time.Second {
 		t.Errorf("bucket 512 due at %v, want now", due)
 	}
 	if got := metric(s.Metrics, "filescale_scrub_last_pass_timestamp_seconds"+diskLabels(d)); got != 1000 {
 		t.Errorf("last pass %v after a restart, want 1000", got)
 	}
 
+	// lengthening pass mid-pass rebases bucket 512 to now instead of sleeping hours
+	saveScrub(d, scrubState{start: time.Now().Add(-bucketOffset(time.Hour, 512)), next: 512})
+	st = loadScrub(d, DefaultScrubPass, DefaultScrubGap)
+	if due := st.start.Add(bucketOffset(DefaultScrubPass, 512)); time.Until(due) > time.Second || time.Since(due) > time.Second {
+		t.Errorf("lengthened pass: bucket 512 due at %v, want now", due)
+	}
+
+	// same pass restarted right after a save keeps the remaining sub-step wait
+	kept := time.Now().Add(bucketOffset(DefaultScrubPass, 1)/2 - bucketOffset(DefaultScrubPass, 512))
+	saveScrub(d, scrubState{start: kept, next: 512})
+	if st := loadScrub(d, DefaultScrubPass, DefaultScrubGap); !st.start.Equal(time.Unix(0, kept.UnixNano())) {
+		t.Errorf("quick restart: start = %v, want %v", st.start, kept)
+	}
+
 	// between passes: the next one starts after the gap, not at once
-	next := time.Now().Add(scrubGap)
+	next := time.Now().Add(DefaultScrubGap)
 	saveScrub(d, scrubState{start: next, last: time.Now()})
-	if st := loadScrub(d); st.next != 0 || !st.start.Equal(time.Unix(0, next.UnixNano())) {
+	if st := loadScrub(d, DefaultScrubPass, DefaultScrubGap); st.next != 0 || !st.start.Equal(time.Unix(0, next.UnixNano())) {
 		t.Errorf("between passes: %+v, want bucket 0 at %v", st, next)
+	}
+	// shortening gap clamps a saved wait to the new gap
+	if st := loadScrub(d, DefaultScrubPass, time.Hour); st.next != 0 || time.Until(st.start) > time.Hour+time.Second || time.Until(st.start) < 59*time.Minute {
+		t.Errorf("shortened gap: %+v, want ~1h from now", st)
+	}
+	if st := loadScrub(d, DefaultScrubPass, 0); st.next != 0 || time.Until(st.start) > time.Second || time.Since(st.start) > time.Second {
+		t.Errorf("zero gap: %+v, want now", st)
 	}
 
 	for _, bad := range []string{"", "garbage", "1 70000 0", "1 -1 0"} {
 		os.WriteFile(filepath.Join(d.dir, "scrub"), []byte(bad), 0o644)
-		if st := loadScrub(d); st.next != 0 || time.Since(st.start) > time.Second {
+		if st := loadScrub(d, DefaultScrubPass, DefaultScrubGap); st.next != 0 || time.Since(st.start) > time.Second {
 			t.Errorf("progress %q: %+v, want a new pass from now", bad, st)
 		}
+	}
+}
+
+func TestScrubLoopTiming(t *testing.T) {
+	m := db.NewMem()
+	base := Config{Dirs: []string{t.TempDir()}, MinFree: 5, Token: token, DB: m, Client: shard.NewClient(token)}
+	badPass := base
+	badPass.ScrubPass = -time.Second
+	if _, err := New(badPass); err == nil {
+		t.Error("negative ScrubPass: want error")
+	}
+	badGap := base
+	badGap.ScrubGap = -time.Second
+	if _, err := New(badGap); err == nil {
+		t.Error("negative ScrubGap: want error")
+	}
+	def, err := New(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if def.ScrubPass != DefaultScrubPass {
+		t.Errorf("default ScrubPass = %v, want %v", def.ScrubPass, DefaultScrubPass)
+	}
+
+	pass, gap := 300*time.Millisecond, 200*time.Millisecond
+	cfg := Config{Dirs: []string{t.TempDir()}, MinFree: 5, Token: token, DB: m, Client: shard.NewClient(token), ScrubPass: pass, ScrubGap: gap}
+	s, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if err := s.Scrub(context.Background(), true, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(start); took < pass*95/100 || took > 5*time.Second {
+		t.Errorf("paced Scrub took %v, want ~%v", took, pass)
+	}
+
+	d := s.list[0]
+	d.scrubbed.Store(0)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		s.scrubLoop(ctx, d)
+		close(done)
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	var first, second int64
+	for time.Now().Before(deadline) {
+		v := d.scrubbed.Load()
+		if first == 0 && v > 0 {
+			first = v
+		} else if first > 0 && v > first {
+			second = v
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("scrubLoop did not stop on cancel")
+	}
+	if first == 0 || second == 0 {
+		t.Fatalf("scrubLoop passes: first=%d second=%d, want two passes", first, second)
+	}
+	if diff := time.Duration(second - first); diff < (pass+gap)*95/100 {
+		t.Errorf("between pass ends: %v, want >= ~%v", diff, pass+gap)
 	}
 }
 
