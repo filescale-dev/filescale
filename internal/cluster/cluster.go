@@ -27,6 +27,7 @@ type Meta struct {
 	DataShards    int    `json:"dataShards,omitempty"`
 	ParityShards  int    `json:"parityShards,omitempty"`
 	SmallFileSize int64  `json:"smallFileSize,omitempty"`
+	NoRepair      bool   `json:"noRepair,omitempty"`
 }
 
 // New joins nothing yet, see Join. rtt, if set, learns each node's round trip from memberlist's probes.
@@ -157,11 +158,20 @@ func Addr(ml *memberlist.Memberlist, port int) string {
 
 // Addrs lists the unique HTTP addresses of live members with the given role.
 func Addrs(ml *memberlist.Memberlist, role string) []string {
+	return filterAddrs(ml, func(m Meta) bool { return m.Role == role })
+}
+
+// RepairAddrs lists the unique HTTP addresses of live serves that run repairs.
+func RepairAddrs(ml *memberlist.Memberlist) []string {
+	return filterAddrs(ml, func(m Meta) bool { return m.Role == "serve" && !m.NoRepair })
+}
+
+func filterAddrs(ml *memberlist.Memberlist, keep func(Meta) bool) []string {
 	seen := map[string]bool{}
 	var out []string
 	for _, n := range ml.Members() {
 		var m Meta
-		if json.Unmarshal(n.Meta, &m) == nil && m.Role == role {
+		if json.Unmarshal(n.Meta, &m) == nil && keep(m) {
 			addr := net.JoinHostPort(n.Addr.String(), strconv.Itoa(m.Port))
 			if !seen[addr] {
 				seen[addr] = true

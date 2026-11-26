@@ -18,6 +18,9 @@ import (
 // Repair rebuilds the shards of stores down longer than after, never touching
 // maintenance. Each serve takes the buckets that hash to it, no leader.
 func (s *Serve) Repair(ctx context.Context, after time.Duration) error {
+	if s.NoRepair {
+		return nil
+	}
 	if err := s.Reload(ctx); err != nil {
 		return err
 	}

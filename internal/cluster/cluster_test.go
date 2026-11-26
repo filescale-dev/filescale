@@ -59,6 +59,23 @@ func TestAddrsDeduplicates(t *testing.T) {
 	}
 }
 
+func TestRepairAddrs(t *testing.T) {
+	rep := node(t, 17966, "", Meta{Role: "serve", Port: 8080})
+	edge := node(t, 17967, "", Meta{Role: "serve", Port: 8082, NoRepair: true})
+	st := node(t, 17968, "", Meta{Role: "store", Port: 8081})
+	for _, m := range []*memberlist.Memberlist{edge, st} {
+		if _, err := m.Join([]string{"127.0.0.1:17966"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := RepairAddrs(rep); !slices.Equal(got, []string{"127.0.0.1:8080"}) {
+		t.Errorf("RepairAddrs = %v, want [127.0.0.1:8080]", got)
+	}
+	if got := Addrs(rep, "serve"); len(got) != 2 {
+		t.Errorf("Addrs(serve) = %v, want both serves", got)
+	}
+}
+
 func TestAliveStoreAddrsAfterLeaveAndShutdown(t *testing.T) {
 	node(t, 17962, "", Meta{Role: "store", Port: 8081})
 	sv, err := New("127.0.0.1", 17963, "", Meta{Role: "serve", Port: 8080}, nil)

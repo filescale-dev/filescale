@@ -35,6 +35,7 @@ type Config struct {
 	// AllowInline accepts ?response-content-disposition=inline (else 400): only behind a
 	// front that already serves inline from its own domain, an uploaded html file renders.
 	AllowInline bool
+	NoRepair    bool
 	// Alive returns the HTTP addresses of live stores (memberlist).
 	Alive func() map[string]bool
 	// Serves returns the live serves and this one's address, to split repair work.
@@ -81,21 +82,25 @@ func (s *Serve) Run(ctx context.Context, repairAfter time.Duration) {
 			log.Printf("stores: %v", err)
 		}
 	}
-	// own goroutine: a long repair must not stall the reload, pick skips stores not seen for 3 min
-	go func() {
-		repair := time.NewTicker(time.Hour)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-repair.C:
-				if err := s.Repair(ctx, repairAfter); err != nil {
-					log.Printf("repair: %v", err)
+	if !s.NoRepair {
+		// own goroutine: a long repair must not stall the reload, pick skips stores not seen for 3 min
+		go func() {
+			repair := time.NewTicker(time.Hour)
+			defer repair.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-repair.C:
+					if err := s.Repair(ctx, repairAfter); err != nil {
+						log.Printf("repair: %v", err)
+					}
 				}
 			}
-		}
-	}()
+		}()
+	}
 	reload := time.NewTicker(30 * time.Second)
+	defer reload.Stop()
 	for {
 		select {
 		case <-ctx.Done():

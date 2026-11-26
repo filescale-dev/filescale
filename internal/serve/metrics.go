@@ -71,11 +71,13 @@ func (s *Serve) Metrics(m *metrics.Writer) {
 		func(st db.Store) float64 { return float64(st.LastSeen.Unix()) })
 	m.Gauge("filescale_stores_reloaded_timestamp_seconds", "Last time the stores table was read from Cassandra.", seconds(s.reloaded.Load()))
 
-	m.Counter("filescale_repaired_shards_total", "Shards rebuilt onto another store by repair.", float64(s.repaired.Load()))
-	m.Counter("filescale_repair_errors_total", "Files repair failed on, retried in the next pass.", float64(s.repairErrors.Load()))
-	m.Gauge("filescale_repair_last_pass_timestamp_seconds", "End of this serve's last repair pass, 0 = none yet.", seconds(s.repairEnded.Load()))
-	m.Gauge("filescale_repair_pass_duration_seconds", "Length of that pass.", seconds(s.repairTook.Load()))
-	m.Gauge("filescale_repair_failed_buckets", "Buckets that pass couldn't read.", float64(s.repairFailed.Load()))
+	if !s.NoRepair {
+		m.Counter("filescale_repaired_shards_total", "Shards rebuilt onto another store by repair.", float64(s.repaired.Load()))
+		m.Counter("filescale_repair_errors_total", "Files repair failed on, retried in the next pass.", float64(s.repairErrors.Load()))
+		m.Gauge("filescale_repair_last_pass_timestamp_seconds", "End of this serve's last repair pass, 0 = none yet.", seconds(s.repairEnded.Load()))
+		m.Gauge("filescale_repair_pass_duration_seconds", "Length of that pass.", seconds(s.repairTook.Load()))
+		m.Gauge("filescale_repair_failed_buckets", "Buckets that pass couldn't read.", float64(s.repairFailed.Load()))
+	}
 }
 
 func one(b bool) float64 {

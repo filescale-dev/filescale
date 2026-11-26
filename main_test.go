@@ -68,6 +68,17 @@ func TestScrubFlags(t *testing.T) {
 	}
 }
 
+func TestNoRepairFlag(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	o := serveFlags(fs)
+	if err := fs.Parse(nil); err != nil || o.noRepair {
+		t.Fatalf("default -noRepair = %v, %v: want false", o.noRepair, err)
+	}
+	if err := fs.Parse([]string{"-noRepair"}); err != nil || !o.noRepair {
+		t.Fatalf("-noRepair = %v, %v: want true", o.noRepair, err)
+	}
+}
+
 // SIGTERM lets a request in flight finish before listen returns; one that outlasts
 // drainWait is cut off.
 func TestListenDrains(t *testing.T) {

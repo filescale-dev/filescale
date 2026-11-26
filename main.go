@@ -46,6 +46,7 @@ type serveOpts struct {
 	smallFileSize int
 	slowRead      time.Duration
 	repairAfter   time.Duration
+	noRepair      bool
 	token         string
 	tokenFor      string
 	only          string
@@ -82,6 +83,7 @@ func serveFlags(fs *flag.FlagSet) *serveOpts {
 	fs.IntVar(&o.smallFileSize, "smallFileSize", 0, "files under this many bytes are replicated instead of erasure coded (default dataShards/parityShards × 512 KiB, 1 MiB for 8+4)")
 	fs.DurationVar(&o.slowRead, "slowRead", 500*time.Millisecond, "read a shard from parity when a store takes longer than this for a block (~50ms for NVMe)")
 	fs.DurationVar(&o.repairAfter, "repairAfter", 24*time.Hour, "rebuild a store's shards elsewhere once it has been down this long")
+	fs.BoolVar(&o.noRepair, "noRepair", false, "do not run repairs on this serve (other serves cover its buckets)")
 	fs.StringVar(&o.token, "token", "", "bearer token required on client requests (empty = $FILESCALE_TOKEN, else open)")
 	kindVar(fs, &o.tokenFor, "tokenFor", `require -token only for "upload" (PUT, DELETE) or "download" (GET, HEAD) requests (default both)`)
 	kindVar(fs, &o.only, "only", `serve only "upload" (PUT, DELETE) or "download" (GET, HEAD) requests (default both)`)
@@ -278,13 +280,13 @@ func runServe(c *commonOpts, o *serveOpts) {
 	defer d.Close()
 	bg, stopBg := context.WithCancel(context.Background())
 	client, rtt := newClient(c.secret)
-	ml := join(bg, c, cluster.Meta{Role: "serve", Port: o.port, DataShards: o.dataShards, ParityShards: o.parityShards, SmallFileSize: int64(o.smallFileSize)}, rtt)
+	ml := join(bg, c, cluster.Meta{Role: "serve", Port: o.port, DataShards: o.dataShards, ParityShards: o.parityShards, SmallFileSize: int64(o.smallFileSize), NoRepair: o.noRepair}, rtt)
 	sv := serve.New(serve.Config{
 		DB: d, Client: client,
 		DataShards: o.dataShards, ParityShards: o.parityShards, SmallFileSize: int64(o.smallFileSize),
-		SlowRead: o.slowRead, Token: o.token, TokenFor: o.tokenFor, Only: o.only, AllowInline: o.allowInline,
+		SlowRead: o.slowRead, Token: o.token, TokenFor: o.tokenFor, Only: o.only, AllowInline: o.allowInline, NoRepair: o.noRepair,
 		Alive:  func() map[string]bool { return cluster.AliveStoreAddrs(ml) },
-		Serves: func() ([]string, string) { return cluster.Addrs(ml, "serve"), cluster.Addr(ml, o.port) },
+		Serves: func() ([]string, string) { return cluster.RepairAddrs(ml), cluster.Addr(ml, o.port) },
 	})
 	if err := sv.Reload(bg); err != nil {
 		log.Printf("stores: %v", err)

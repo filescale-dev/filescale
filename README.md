@@ -96,6 +96,7 @@ curl -X DELETE http://127.0.0.1:8080/photos/cat.jpg
 | `-smallFileSize` | d/p × 512 KiB | files under this are copied instead of coded |
 | `-slowRead` | 500ms | how long a lagging store may hold up a read, ~50ms for NVMe |
 | `-repairAfter` | 24h | rebuild a store's shards once it's been down this long |
+| `-noRepair` | off | do not run repairs on this serve (other serves cover its buckets) |
 | `-token` | `$FILESCALE_TOKEN`, else open | bearer token for clients |
 | `-tokenFor` | both | `upload` or `download` only |
 | `-only` | both | serve only `upload` or `download` requests |
@@ -266,6 +267,7 @@ Files up to 64 MiB are one part and just get sent again. Unfinished uploads expi
   - `-token` protects the whole client API
   - `-tokenFor upload` leaves downloads open (authenticated write, public read)
   - `-only upload|download` enforces uploads only or downloads only.
+  - `-noRepair` opts a serve out of background repairs (its buckets are split across the remaining serves; keep at least one serve repairing).
 - **Plain HTTP**: There is no TLS: the token blocks unauthenticated use, not someone sniffing the network.
   - Keep serves, stores and metrics on a private network. `-metricsPort` has no auth, and its labels include store addresses and disk paths.
 - **Store disks**: Use XFS (or ext4) mounted with `noatime`.
@@ -335,11 +337,11 @@ Alerts worth setting up:
 | `filescale_store_free_bytes` | gauge | `store`, `addr` | Bytes left for uploads, from the store's last heartbeat |
 | `filescale_store_last_seen_timestamp_seconds` | gauge | `store`, `addr` | The store's last heartbeat |
 | `filescale_stores_reloaded_timestamp_seconds` | gauge | | Last time the stores table was read from Cassandra |
-| `filescale_repaired_shards_total` | counter | | Shards rebuilt onto another store by repair |
-| `filescale_repair_errors_total` | counter | | Files repair failed on, retried in the next pass |
-| `filescale_repair_last_pass_timestamp_seconds` | gauge | | End of this serve's last repair pass, 0 = none yet |
-| `filescale_repair_pass_duration_seconds` | gauge | | Length of that pass |
-| `filescale_repair_failed_buckets` | gauge | | Buckets that pass couldn't read |
+| `filescale_repaired_shards_total` | counter | | Shards rebuilt onto another store by repair (omitted with `-noRepair`) |
+| `filescale_repair_errors_total` | counter | | Files repair failed on, retried in the next pass (omitted with `-noRepair`) |
+| `filescale_repair_last_pass_timestamp_seconds` | gauge | | End of this serve's last repair pass, 0 = none yet (omitted with `-noRepair`) |
+| `filescale_repair_pass_duration_seconds` | gauge | | Length of that pass (omitted with `-noRepair`) |
+| `filescale_repair_failed_buckets` | gauge | | Buckets that pass couldn't read (omitted with `-noRepair`) |
 
 ### store
 

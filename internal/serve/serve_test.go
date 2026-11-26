@@ -1110,6 +1110,33 @@ func TestRepair(t *testing.T) {
 	}
 }
 
+func TestNoRepair(t *testing.T) {
+	e := newEnv(t, 13, func(cfg *Config) { cfg.NoRepair = true })
+	ctx := context.Background()
+	e.mustPut("f", random(100<<10))
+	f := e.file("f")
+	lost := e.node(f.Stores[0])
+	e.kill(lost)
+	e.db.Heartbeat(ctx, db.Store{ID: lost.id, Addr: lost.addr, LastSeen: time.Now().Add(-25 * time.Hour)})
+	if err := e.sv.Repair(ctx, 24*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if e.file("f").Stores[0] != lost.id || !e.hasRow(lost.id, f.ID) {
+		t.Error("NoRepair serve moved a shard")
+	}
+	for _, series := range []string{
+		"filescale_repaired_shards_total",
+		"filescale_repair_errors_total",
+		"filescale_repair_last_pass_timestamp_seconds",
+		"filescale_repair_pass_duration_seconds",
+		"filescale_repair_failed_buckets",
+	} {
+		if got := metric(e.sv.Metrics, series); got != -1 {
+			t.Errorf("%s = %v on NoRepair serve, want omitted", series, got)
+		}
+	}
+}
+
 func TestRepairSkipsMaintenance(t *testing.T) {
 	e := newEnv(t, 13)
 	ctx := context.Background()
