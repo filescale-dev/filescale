@@ -251,7 +251,7 @@ func (s *Serve) pick(n int, size int64, skip map[string]bool, prefer []db.UUID) 
 		}
 	}
 	if len(up) < n {
-		return nil, &statusError{http.StatusServiceUnavailable, fmt.Sprintf("need %d servers, %d up", n, len(up))}
+		return nil, &statusError{http.StatusServiceUnavailable, fmt.Sprintf("need %d servers, %d writable", n, len(up))}
 	}
 	if len(roomy) < n {
 		return nil, &statusError{http.StatusInsufficientStorage, fmt.Sprintf("need %d servers with %d bytes free, %d have it", n, size, len(roomy))}
@@ -297,9 +297,14 @@ func (s *Serve) pick(n int, size int64, skip map[string]bool, prefer []db.UUID) 
 	return picked, nil
 }
 
-// usable is a store uploads can pick: alive in memberlist, not in maintenance, seen in the last 3 minutes.
-func usable(st db.Store, alive map[string]bool) bool {
+// storeUp is a store alive in memberlist, not in maintenance, seen in the last 3 minutes.
+func storeUp(st db.Store, alive map[string]bool) bool {
 	return st.State != "maintenance" && alive[st.Addr] && time.Since(st.LastSeen) <= 3*time.Minute
+}
+
+// usable is a store uploads and repairs can write to.
+func usable(st db.Store, alive map[string]bool) bool {
+	return st.State != "readonly" && storeUp(st, alive)
 }
 
 // addrs maps a file's shards to live store addresses, "" when offline.

@@ -121,7 +121,7 @@ type Shard struct {
 type Store struct {
 	ID       UUID
 	Addr     string
-	State    string // "" (up) or "maintenance"
+	State    string // "", "up", "readonly", or "maintenance"
 	Free     int64  // bytes left for uploads
 	LastSeen time.Time
 }

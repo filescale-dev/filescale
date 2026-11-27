@@ -1154,6 +1154,196 @@ func TestRepairSkipsMaintenance(t *testing.T) {
 	}
 }
 
+func TestReadOnlyStore(t *testing.T) {
+	e := newEnv(t, 13)
+	orig := random(100 << 10)
+	e.mustPut("existing", orig)
+	origFile := e.file("existing")
+	ro := e.node(origFile.Stores[0])
+	rw := e.node(origFile.Stores[1])
+
+	e.db.SetState(ro.id, "readonly")
+	e.reload()
+
+	for series, want := range map[string]float64{
+		fmt.Sprintf(`filescale_store_up{store="%s",addr="%s"}`, ro.id, ro.addr):          1,
+		fmt.Sprintf(`filescale_store_readonly{store="%s",addr="%s"}`, ro.id, ro.addr):    1,
+		fmt.Sprintf(`filescale_store_maintenance{store="%s",addr="%s"}`, ro.id, ro.addr): 0,
+		fmt.Sprintf(`filescale_store_up{store="%s",addr="%s"}`, rw.id, rw.addr):          1,
+		fmt.Sprintf(`filescale_store_readonly{store="%s",addr="%s"}`, rw.id, rw.addr):    0,
+	} {
+		if got := metric(e.sv.Metrics, series); got != want {
+			t.Errorf("%s = %v, want %v", series, got, want)
+		}
+	}
+
+	for i := range 5 {
+		big := fmt.Sprintf("big-%d", i)
+		e.mustPut(big, random(100<<10))
+		if slices.Contains(e.file(big).Stores, ro.id) {
+			t.Fatalf("upload %s picked readonly store %s", big, ro.id)
+		}
+		small := fmt.Sprintf("small-%d", i)
+		e.mustPut(small, random(100))
+		if slices.Contains(e.file(small).Stores, ro.id) {
+			t.Fatalf("upload %s picked readonly store %s", small, ro.id)
+		}
+	}
+
+	picked, err := e.sv.pick(12, 1, nil, origFile.Stores)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.ContainsFunc(picked, func(st db.Store) bool { return st.ID == ro.id }) {
+		t.Error("pick kept readonly store from prefer")
+	}
+
+	// multi-disk host: readonly disk skipped, sibling writable disk still picked
+	alive := map[string]bool{"h0": true}
+	roID, _ := db.NewID()
+	rwID, _ := db.NewID()
+	stores := []db.Store{
+		{ID: roID, Addr: "h0", State: "readonly", Free: 1 << 50, LastSeen: time.Now()},
+		{ID: rwID, Addr: "h0", State: "up", Free: 100, LastSeen: time.Now()},
+	}
+	for i := 1; i < 12; i++ {
+		id, _ := db.NewID()
+		addr := fmt.Sprintf("h%d", i)
+		stores = append(stores, db.Store{ID: id, Addr: addr, Free: 100, LastSeen: time.Now()})
+		alive[addr] = true
+	}
+	sv := New(Config{Alive: func() map[string]bool { return alive }})
+	sv.stores.Store(&storeView{list: stores})
+	got, err := sv.pick(12, 1, nil, []db.UUID{roID})
+	if err != nil {
+		t.Fatalf("multi-disk pick: %v", err)
+	}
+	if slices.ContainsFunc(got, func(st db.Store) bool { return st.ID == roID }) {
+		t.Error("picked readonly disk on multi-disk host")
+	}
+	if !slices.ContainsFunc(got, func(st db.Store) bool { return st.ID == rwID }) {
+		t.Error("skipped writable disk on multi-disk host")
+	}
+
+	if resp, body := e.do("GET", "existing", nil); resp.StatusCode != http.StatusOK || !bytes.Equal(body, orig) {
+		t.Fatalf("GET with readonly store: %s", resp.Status)
+	}
+	if rebuilt := metric(e.sv.Metrics, "filescale_parity_stripes_total"); rebuilt != 0 {
+		t.Errorf("GET rebuilt %v stripes with live readonly store", rebuilt)
+	}
+
+	// dropping below 12 writable servers fails 8+4 uploads
+	e.db.SetState(rw.id, "readonly")
+	e.reload()
+	if resp, b := e.do("PUT", "blocked", random(100<<10)); resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("11 writable servers for 8+4: %s %s", resp.Status, b)
+	}
+
+	// restoring to "up" makes both stores writable again
+	e.db.SetState(ro.id, "up")
+	e.db.SetState(rw.id, "up")
+	e.reload()
+	if got := metric(e.sv.Metrics, fmt.Sprintf(`filescale_store_readonly{store="%s",addr="%s"}`, ro.id, ro.addr)); got != 0 {
+		t.Errorf("readonly after restore = %v, want 0", got)
+	}
+	var spare *node
+	for _, n := range e.nodes {
+		if !slices.Contains(origFile.Stores, n.id) {
+			spare = n
+			break
+		}
+	}
+	e.db.SetState(spare.id, "readonly")
+	e.reload()
+	e.mustPut("restored", random(100<<10))
+	if f := e.file("restored"); !slices.Contains(f.Stores, ro.id) || !slices.Contains(f.Stores, rw.id) {
+		t.Errorf("restored stores not picked: %v", f.Stores)
+	}
+}
+
+func TestRepairWithReadOnlyStore(t *testing.T) {
+	t.Run("live_readonly_source_not_target", func(t *testing.T) {
+		e := newEnv(t, 14)
+		ctx := context.Background()
+		data := random(100 << 10)
+		e.mustPut("f", data)
+		f := e.file("f")
+
+		var spares []*node
+		for _, n := range e.nodes {
+			if !slices.Contains(f.Stores, n.id) {
+				spares = append(spares, n)
+			}
+		}
+		spareRO, spareRW := spares[0], spares[1]
+		lost := e.node(f.Stores[0])
+		srcRO := e.node(f.Stores[1])
+
+		e.db.SetState(spareRO.id, "readonly")
+		e.db.SetState(srcRO.id, "readonly")
+		e.kill(lost)
+		e.db.Heartbeat(ctx, db.Store{ID: lost.id, Addr: lost.addr, LastSeen: time.Now().Add(-25 * time.Hour)})
+		// kill 3 peers so repair must read from srcRO to have 8 shards
+		for k := 2; k <= 4; k++ {
+			e.kill(e.node(f.Stores[k]))
+		}
+		if err := e.sv.Repair(ctx, 24*time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		if got := e.file("f").Stores[0]; got != spareRW.id {
+			t.Fatalf("repaired shard 0 to %s, want writable spare %s (readonly spare %s)", got, spareRW.id, spareRO.id)
+		}
+		e.kill(e.node(f.Stores[5]))
+		e.reload()
+		if resp, got := e.do("GET", "f", nil); resp.StatusCode != http.StatusOK || !bytes.Equal(got, data) {
+			t.Errorf("GET through repaired and readonly shards: %s", resp.Status)
+		}
+	})
+
+	t.Run("dead_readonly_repaired_and_forgotten", func(t *testing.T) {
+		e := newEnv(t, 13)
+		ctx := context.Background()
+		data := random(100 << 10)
+		e.mustPut("ro", data)
+		f := e.file("ro")
+		ro := e.node(f.Stores[0])
+
+		e.db.SetState(ro.id, "readonly")
+		e.kill(ro)
+		e.db.Heartbeat(ctx, db.Store{ID: ro.id, Addr: ro.addr, LastSeen: time.Now().Add(-25 * time.Hour)})
+		e.reload()
+
+		if got := metric(e.sv.Metrics, fmt.Sprintf(`filescale_store_up{store="%s",addr="%s"}`, ro.id, ro.addr)); got != 0 {
+			t.Errorf("dead readonly store_up = %v, want 0", got)
+		}
+		if got := metric(e.sv.Metrics, fmt.Sprintf(`filescale_store_readonly{store="%s",addr="%s"}`, ro.id, ro.addr)); got != 1 {
+			t.Errorf("dead readonly store_readonly = %v, want 1", got)
+		}
+
+		if err := e.sv.Repair(ctx, 24*time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		f2 := e.file("ro")
+		if f2.Stores[0] == ro.id {
+			t.Fatal("dead readonly store shard not repaired")
+		}
+		if e.hasRow(ro.id, f.ID) || !e.hasRow(f2.Stores[0], f.ID) {
+			t.Error("index row not moved off dead readonly store")
+		}
+		stores, _ := e.db.Stores(ctx)
+		if slices.ContainsFunc(stores, func(s db.Store) bool { return s.ID == ro.id }) {
+			t.Error("empty dead readonly store's row kept")
+		}
+		for k := 1; k <= 4; k++ {
+			e.kill(e.node(f2.Stores[k]))
+		}
+		e.reload()
+		if resp, got := e.do("GET", "ro", nil); resp.StatusCode != http.StatusOK || !bytes.Equal(got, data) {
+			t.Errorf("GET through rebuilt shard: %s", resp.Status)
+		}
+	})
+}
+
 // hookDB runs its hooks before File and Shards queries, an error from onShards fails the query.
 type hookDB struct {
 	db.DB

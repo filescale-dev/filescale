@@ -291,10 +291,15 @@ Stores are managed in the `stores` table:
 UPDATE stores SET state = 'maintenance' WHERE store_id IN (...);
 UPDATE stores SET state = 'up' WHERE store_id IN (...);
 
+-- read-only: no uploads or repair writes, still serves reads and repairs if it dies
+UPDATE stores SET state = 'readonly' WHERE store_id IN (...);
+UPDATE stores SET state = 'up' WHERE store_id IN (...);
+
 -- decommission: stop the store (or drop its -dir), then skip the -repairAfter wait
 UPDATE stores SET last_seen = '2000-01-01' WHERE store_id = ...;
 ```
 
+Serves pick up `stores` changes within 30s (upgrade all serves before using `'readonly'`).
 A decommissioned store is done when its `stores` row is gone, one server at a time.
 The `store_id`s of a store are in its startup log and in `<dir>/store_id`.
 
@@ -332,8 +337,9 @@ Alerts worth setting up:
 | `filescale_download_cut_total` | counter | | Downloads cut off after the headers: a stripe had fewer than `data_shards` readable shards |
 | `filescale_slow_drops_total` | counter | `store` | Downloads that dropped a slow store and read parity instead |
 | `filescale_put_refused_total` | counter | `store` | Shard PUTs a store failed before any data: refused, an error, or no `100 Continue` in time |
-| `filescale_store_up` | gauge | `store`, `addr` | 1 if uploads can pick the store: alive in memberlist, not in maintenance, seen in the last 3 minutes |
+| `filescale_store_up` | gauge | `store`, `addr` | 1 if the store is up: alive in memberlist, not in maintenance, seen in the last 3 minutes |
 | `filescale_store_maintenance` | gauge | `store`, `addr` | 1 if the store is in maintenance |
+| `filescale_store_readonly` | gauge | `store`, `addr` | 1 if the store is read-only (no uploads or repair writes) |
 | `filescale_store_free_bytes` | gauge | `store`, `addr` | Bytes left for uploads, from the store's last heartbeat |
 | `filescale_store_last_seen_timestamp_seconds` | gauge | `store`, `addr` | The store's last heartbeat |
 | `filescale_stores_reloaded_timestamp_seconds` | gauge | | Last time the stores table was read from Cassandra |

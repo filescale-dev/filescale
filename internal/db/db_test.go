@@ -342,6 +342,19 @@ func testDB(t *testing.T, d DB) {
 	if err != nil || i < 0 || stores[i].Addr != "10.0.0.1:8081" || stores[i].Free != 5 || !stores[i].LastSeen.Equal(now) || stores[i].State != "" {
 		t.Fatalf("Stores = %+v, %v", stores, err)
 	}
+	if c, ok := d.(*Cassandra); ok {
+		if err := c.s.Query(`UPDATE stores SET state = 'readonly' WHERE store_id = ?`, s1).ExecContext(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := d.Heartbeat(ctx, Store{ID: s1, Addr: "10.0.0.1:8081", Free: 9, LastSeen: now}); err != nil {
+			t.Fatal(err)
+		}
+		stores, err = d.Stores(ctx)
+		i = slices.IndexFunc(stores, func(s Store) bool { return s.ID == s1 })
+		if err != nil || i < 0 || stores[i].State != "readonly" || stores[i].Free != 9 {
+			t.Fatalf("Stores after readonly heartbeat = %+v, %v", stores, err)
+		}
+	}
 	if err := d.DeleteStore(ctx, s1); err != nil {
 		t.Fatal(err)
 	}
@@ -437,6 +450,25 @@ func TestMemTTLOfUploads(t *testing.T) {
 	m.PutPart(ctx, UploadPart{Name: "t", UploadID: up, Index: 1, ID: newID(t), Total: 10})
 	if rows, err := m.UploadParts(ctx, "t", up); err != nil || len(rows) != 1 || rows[0].Index != 1 {
 		t.Fatalf("rows = %+v, %v", rows, err)
+	}
+}
+
+func TestMemHeartbeatPreservesState(t *testing.T) {
+	m := NewMem()
+	ctx := context.Background()
+	id := newID(t)
+	if err := m.Heartbeat(ctx, Store{ID: id, Addr: "10.0.0.1:8081", Free: 10, LastSeen: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	for _, state := range []string{"readonly", "maintenance", "up"} {
+		m.SetState(id, state)
+		if err := m.Heartbeat(ctx, Store{ID: id, Addr: "10.0.0.1:8081", Free: 20, LastSeen: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+		stores, err := m.Stores(ctx)
+		if err != nil || len(stores) != 1 || stores[0].State != state || stores[0].Free != 20 {
+			t.Fatalf("state %q after heartbeat: %+v, %v", state, stores, err)
+		}
 	}
 }
 

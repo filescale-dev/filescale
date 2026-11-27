@@ -61,10 +61,12 @@ func (s *Serve) Metrics(m *metrics.Writer) {
 			write(name, help, v(st), "store", st.ID.String(), "addr", st.Addr)
 		}
 	}
-	each(m.Gauge, "filescale_store_up", "1 if uploads can pick the store: alive in memberlist, not in maintenance, seen in the last 3 minutes.",
-		func(st db.Store) float64 { return one(usable(st, alive)) })
+	each(m.Gauge, "filescale_store_up", "1 if the store is up: alive in memberlist, not in maintenance, seen in the last 3 minutes.",
+		func(st db.Store) float64 { return one(storeUp(st, alive)) })
 	each(m.Gauge, "filescale_store_maintenance", "1 if the store is in maintenance.",
 		func(st db.Store) float64 { return one(st.State == "maintenance") })
+	each(m.Gauge, "filescale_store_readonly", "1 if the store is read-only.",
+		func(st db.Store) float64 { return one(st.State == "readonly") })
 	each(m.Gauge, "filescale_store_free_bytes", "Bytes left for uploads, from the store's last heartbeat.",
 		func(st db.Store) float64 { return float64(st.Free) })
 	each(m.Gauge, "filescale_store_last_seen_timestamp_seconds", "The store's last heartbeat.",
