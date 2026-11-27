@@ -36,6 +36,7 @@ type commonOpts struct {
 	replication int
 	secret      string
 	metricsPort int
+	metricsAuth string
 	drainWait   time.Duration
 }
 
@@ -70,7 +71,8 @@ func commonFlags(fs *flag.FlagSet) *commonOpts {
 	fs.StringVar(&o.keyspace, "keyspace", "filescale", "Cassandra keyspace")
 	fs.IntVar(&o.replication, "replication", 1, "Cassandra keyspace replication factor, only used when creating the keyspace (1 for a single node)")
 	fs.StringVar(&o.secret, "secret", "", "shared cluster secret: encrypts gossip and authenticates store requests (empty = $FILESCALE_SECRET, else off)")
-	fs.IntVar(&o.metricsPort, "metricsPort", 0, "port for Prometheus metrics at /metrics, 0 = off; no auth, keep it on the private network")
+	fs.IntVar(&o.metricsPort, "metricsPort", 0, "port for Prometheus metrics at /metrics, 0 = off")
+	fs.StringVar(&o.metricsAuth, "metricsAuth", "", "basic auth user:pass for -metricsPort (empty = $FILESCALE_METRICS_AUTH, else open)")
 	fs.DurationVar(&o.drainWait, "drainWait", 30*time.Second, "how long a shutdown waits for requests in flight")
 	return o
 }
@@ -123,12 +125,25 @@ func kindVar(fs *flag.FlagSet, p *string, name, usage string) {
 	})
 }
 
-// fromEnv fills an empty flag from an environment variable, so a deploy can keep the secret
-// and token off the command line (ps, /proc/*/cmdline). Not flag defaults: -h prints those.
+// fromEnv keeps secrets off the command line without making them flag defaults that -h prints.
 func fromEnv(p *string, name string) {
 	if *p == "" {
 		*p = os.Getenv(name)
 	}
+}
+
+func initCommon(c *commonOpts) error {
+	fromEnv(&c.secret, "FILESCALE_SECRET")
+	fromEnv(&c.metricsAuth, "FILESCALE_METRICS_AUTH")
+	if c.drainWait < 0 {
+		return fmt.Errorf("-drainWait %v: want >= 0", c.drainWait)
+	}
+	if c.metricsAuth != "" {
+		if _, _, err := metrics.ParseBasicAuth(c.metricsAuth); err != nil {
+			return fmt.Errorf("-metricsAuth: %w", err)
+		}
+	}
+	return nil
 }
 
 func usage() {
@@ -153,11 +168,10 @@ func main() {
 	case "serve":
 		o := serveFlags(fs)
 		fs.Parse(os.Args[2:])
-		fromEnv(&c.secret, "FILESCALE_SECRET")
-		fromEnv(&o.token, "FILESCALE_TOKEN")
-		if c.drainWait < 0 {
-			log.Fatalf("-drainWait %v: want >= 0", c.drainWait)
+		if err := initCommon(c); err != nil {
+			log.Fatal(err)
 		}
+		fromEnv(&o.token, "FILESCALE_TOKEN")
 		if _, err := erasure.New(o.dataShards, o.parityShards); err != nil {
 			log.Fatalf("-dataShards %d -parityShards %d: %v", o.dataShards, o.parityShards, err)
 		}
@@ -171,9 +185,8 @@ func main() {
 	case "store":
 		o := storeFlags(fs)
 		fs.Parse(os.Args[2:])
-		fromEnv(&c.secret, "FILESCALE_SECRET")
-		if c.drainWait < 0 {
-			log.Fatalf("-drainWait %v: want >= 0", c.drainWait)
+		if err := initCommon(c); err != nil {
+			log.Fatal(err)
 		}
 		if o.minFreeSpace < 0 || o.minFreeSpace > 100 {
 			log.Fatalf("-minFreeSpace %d: want 0-100", o.minFreeSpace)
@@ -260,6 +273,9 @@ func logCommon(cmd string, c *commonOpts) {
 	shown := *c
 	if shown.secret != "" {
 		shown.secret = "set"
+	}
+	if shown.metricsAuth != "" {
+		shown.metricsAuth = "set"
 	}
 	log.Printf("filescale %s: %+v", cmd, shown)
 }
@@ -385,6 +401,18 @@ func serveMetrics(c *commonOpts, write func(*metrics.Writer)) *http.Server {
 	if c.metricsPort == 0 {
 		return nil
 	}
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", metrics.Handler(write))
+	var h http.Handler = mux
+	auth := "no auth"
+	if c.metricsAuth != "" {
+		user, pass, err := metrics.ParseBasicAuth(c.metricsAuth)
+		if err != nil {
+			log.Fatalf("-metricsAuth: %v", err)
+		}
+		h = metrics.BasicAuth(mux, user, pass)
+		auth = "basic auth"
+	}
 	ln, err := inheritedListener("FILESCALE_METRICS_FD")
 	if err != nil {
 		log.Fatal(err)
@@ -395,14 +423,12 @@ func serveMetrics(c *commonOpts, write func(*metrics.Writer)) *http.Server {
 			log.Fatal(err)
 		}
 	}
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", metrics.Handler(write))
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{Handler: h, ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("metrics: %v", err)
 		}
 	}()
-	log.Printf("metrics on %s/metrics", ln.Addr())
+	log.Printf("metrics on %s/metrics (%s)", ln.Addr(), auth)
 	return srv
 }

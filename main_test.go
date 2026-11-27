@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -43,6 +45,52 @@ func TestMetricsPort(t *testing.T) {
 	b, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK || !strings.Contains(string(b), "\ngo_goroutines ") || !strings.Contains(string(b), "\nfilescale_test_total 7\n") {
 		t.Errorf("%s\n%s", resp.Status, b)
+	}
+}
+
+func TestMetricsPortAuth(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	c := commonFlags(fs)
+	port := freePort(t)
+	if err := fs.Parse([]string{"-ip=127.0.0.1", fmt.Sprint("-metricsPort=", port), "-metricsAuth=prom:s:ecret"}); err != nil {
+		t.Fatal(err)
+	}
+	srv := serveMetrics(c, func(m *metrics.Writer) { m.Counter("filescale_test_total", "Test.", 7) })
+	t.Cleanup(func() { srv.Close() })
+
+	fetch := func(path, user, pass string) (int, string, string) {
+		req, err := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d%s", port, path), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if user != "" || pass != "" {
+			req.SetBasicAuth(user, pass)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, resp.Header.Get("WWW-Authenticate"), string(b)
+	}
+
+	code, hdr, body := fetch("/metrics", "", "")
+	if code != http.StatusUnauthorized || hdr != `Basic realm="metrics"` || strings.Contains(body, "filescale_test_total") {
+		t.Errorf("unauth /metrics: %d %q\n%s", code, hdr, body)
+	}
+	if code, _, _ := fetch("/other", "", ""); code != http.StatusUnauthorized {
+		t.Errorf("unauth /other: %d, want 401", code)
+	}
+	if code, _, _ := fetch("/metrics", "prom", "wrong"); code != http.StatusUnauthorized {
+		t.Errorf("wrong pass /metrics: %d, want 401", code)
+	}
+	code, _, body = fetch("/metrics", "prom", "s:ecret")
+	if code != http.StatusOK || !strings.Contains(body, "\ngo_goroutines ") || !strings.Contains(body, "\nfilescale_test_total 7\n") {
+		t.Errorf("valid /metrics: %d\n%s", code, body)
+	}
+	if code, _, _ := fetch("/other", "prom", "s:ecret"); code != http.StatusNotFound {
+		t.Errorf("valid /other: %d, want 404", code)
 	}
 }
 
@@ -341,10 +389,14 @@ func TestCLIValidationBeforeSupervise(t *testing.T) {
 		{"store", "-h"},
 		{"serve", "-drainWait", "-1s"},
 		{"serve", "-dataShards", "0"},
+		{"serve", "-metricsAuth", "nocolon"},
+		{"serve", "-metricsAuth", ":pass"},
+		{"serve", "-metricsAuth", "user:"},
 		{"store", "-minFreeSpace", "101"},
 		{"store", "-scrubPass", "0"},
 		{"store", "-scrubPass", "-1s"},
 		{"store", "-scrubGap", "-1s"},
+		{"store", "-metricsAuth", "nocolon"},
 	} {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		out, err := exec.CommandContext(ctx, bin, args...).CombinedOutput()
@@ -355,6 +407,31 @@ func TestCLIValidationBeforeSupervise(t *testing.T) {
 		}
 		if args[1] != "-h" && err == nil {
 			t.Errorf("%v: want non-zero exit", args)
+		}
+		if args[1] == "-metricsAuth" && strings.Contains(string(out), args[2]) {
+			t.Errorf("%v: output leaked secret:\n%s", args, out)
+		}
+	}
+
+	for _, args := range [][]string{{"serve"}, {"store"}, {"serve", "-h"}} {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		cmd := exec.CommandContext(ctx, bin, args...)
+		cmd.Env = append(os.Environ(), "FILESCALE_METRICS_AUTH=badval")
+		out, err := cmd.CombinedOutput()
+		hung := ctx.Err() != nil
+		cancel()
+		if hung {
+			t.Fatalf("%v (env) hung (spawned supervisor?):\n%s", args, out)
+		}
+		if len(args) > 1 && args[1] == "-h" {
+			if err != nil {
+				t.Errorf("%v (env): want exit 0, got %v\n%s", args, err, out)
+			}
+		} else if err == nil {
+			t.Errorf("%v (env): want non-zero exit", args)
+		}
+		if strings.Contains(string(out), "badval") {
+			t.Errorf("%v (env): output leaked secret:\n%s", args, out)
 		}
 	}
 }
@@ -442,10 +519,11 @@ func TestKindFlags(t *testing.T) {
 	}
 }
 
-// An empty -secret or -token falls back to its environment variable, a flag wins over it.
+// An empty -secret, -token, or -metricsAuth falls back to its environment variable, a flag wins over it.
 func TestFromEnv(t *testing.T) {
 	t.Setenv("FILESCALE_SECRET", "env-secret")
 	t.Setenv("FILESCALE_TOKEN", "")
+	t.Setenv("FILESCALE_METRICS_AUTH", "env:pass")
 	fs := flag.NewFlagSet("test", flag.ContinueOnError)
 	common := commonFlags(fs)
 	serve := serveFlags(fs)
@@ -453,21 +531,65 @@ func TestFromEnv(t *testing.T) {
 		t.Fatal(err)
 	}
 	fromEnv(&common.secret, "FILESCALE_SECRET")
+	fromEnv(&common.metricsAuth, "FILESCALE_METRICS_AUTH")
 	fromEnv(&serve.token, "FILESCALE_TOKEN")
-	if common.secret != "env-secret" || serve.token != "flag-token" {
-		t.Errorf("secret = %q, token = %q", common.secret, serve.token)
+	if common.secret != "env-secret" || common.metricsAuth != "env:pass" || serve.token != "flag-token" {
+		t.Errorf("secret = %q, metricsAuth = %q, token = %q", common.secret, common.metricsAuth, serve.token)
 	}
 
 	t.Setenv("FILESCALE_TOKEN", "env-token")
 	fs = flag.NewFlagSet("test", flag.ContinueOnError)
 	common = commonFlags(fs)
 	serve = serveFlags(fs)
-	if err := fs.Parse([]string{"-secret=flag-secret"}); err != nil {
+	if err := fs.Parse([]string{"-secret=flag-secret", "-metricsAuth=flag:pass"}); err != nil {
 		t.Fatal(err)
 	}
 	fromEnv(&common.secret, "FILESCALE_SECRET")
+	fromEnv(&common.metricsAuth, "FILESCALE_METRICS_AUTH")
 	fromEnv(&serve.token, "FILESCALE_TOKEN")
-	if common.secret != "flag-secret" || serve.token != "env-token" {
-		t.Errorf("secret = %q, token = %q", common.secret, serve.token)
+	if common.secret != "flag-secret" || common.metricsAuth != "flag:pass" || serve.token != "env-token" {
+		t.Errorf("secret = %q, metricsAuth = %q, token = %q", common.secret, common.metricsAuth, serve.token)
+	}
+}
+
+func TestInitCommon(t *testing.T) {
+	t.Setenv("FILESCALE_SECRET", "")
+	t.Setenv("FILESCALE_METRICS_AUTH", "prom:secret")
+	c := &commonOpts{}
+	if err := initCommon(c); err != nil {
+		t.Fatalf("valid env auth with metricsPort=0: %v", err)
+	}
+	if c.metricsAuth != "prom:secret" {
+		t.Errorf("metricsAuth = %q, want prom:secret", c.metricsAuth)
+	}
+
+	c = &commonOpts{metricsAuth: "flag:pass"}
+	if err := initCommon(c); err != nil {
+		t.Fatalf("flag overrides env: %v", err)
+	}
+	if c.metricsAuth != "flag:pass" {
+		t.Errorf("metricsAuth = %q, want flag:pass", c.metricsAuth)
+	}
+
+	t.Setenv("FILESCALE_METRICS_AUTH", "badsecret")
+	if err := initCommon(&commonOpts{}); err == nil {
+		t.Fatal("malformed env auth: want error")
+	} else if strings.Contains(err.Error(), "badsecret") {
+		t.Errorf("error leaked secret: %v", err)
+	}
+
+	var buf bytes.Buffer
+	origOut := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(origOut) })
+	logCommon("serve", &commonOpts{secret: "s3cr3t", metricsAuth: "prom:p4ss"})
+	out := buf.String()
+	for _, leak := range []string{"s3cr3t", "p4ss", "prom:"} {
+		if strings.Contains(out, leak) {
+			t.Errorf("logCommon leaked %q in %q", leak, out)
+		}
+	}
+	if !strings.Contains(out, "secret:set") || !strings.Contains(out, "metricsAuth:set") {
+		t.Errorf("logCommon missing redacted fields: %q", out)
 	}
 }

@@ -3,6 +3,9 @@ package metrics
 
 import (
 	"cmp"
+	"crypto/sha256"
+	"crypto/subtle"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -63,6 +66,37 @@ func Handler(write func(*Writer)) http.Handler {
 		m := NewWriter(w)
 		process(m)
 		write(m)
+	})
+}
+
+// ParseBasicAuth splits a "user:pass" credential on the first colon.
+func ParseBasicAuth(s string) (user, pass string, err error) {
+	user, pass, ok := strings.Cut(s, ":")
+	if !ok || user == "" || pass == "" {
+		return "", "", errors.New("want user:pass")
+	}
+	if strings.IndexFunc(s, func(r rune) bool { return r < 0x20 || r == 0x7f }) >= 0 {
+		return "", "", errors.New("control characters not allowed")
+	}
+	return user, pass, nil
+}
+
+// BasicAuth protects next with HTTP Basic authentication.
+func BasicAuth(next http.Handler, user, pass string) http.Handler {
+	valid := user != "" && pass != ""
+	wantUser := sha256.Sum256([]byte(user))
+	wantPass := sha256.Sum256([]byte(pass))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		u, p, ok := r.BasicAuth()
+		gotUser := sha256.Sum256([]byte(u))
+		gotPass := sha256.Sum256([]byte(p))
+		if !valid || !ok ||
+			subtle.ConstantTimeCompare(gotUser[:], wantUser[:])&subtle.ConstantTimeCompare(gotPass[:], wantPass[:]) != 1 {
+			w.Header().Set("WWW-Authenticate", `Basic realm="metrics"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 
